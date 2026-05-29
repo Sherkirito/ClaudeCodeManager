@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Manager</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <nav class="sidebar">
+    <div class="logo"><h2>Claude Manager</h2></div>
+    <ul class="nav-list">
+      <li data-page="dashboard" class="active"><span class="nav-icon">📊</span> Dashboard</li>
+      <li data-page="projects"><span class="nav-icon">📁</span> Projects</li>
+      <li data-page="settings"><span class="nav-icon">⚙️</span> Settings</li>
+    </ul>
+    <div class="sidebar-footer"><small>v1.1 local</small></div>
+  </nav>
+  <main class="content">
+    <div id="page-content">
+      <div class="loading"><div class="spinner"></div><p>Loading...</p></div>
+    </div>
+  </main>
+</div>
+
+<noscript>
+  <div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-family:sans-serif;">
+    <h1>JavaScript Required</h1>
+    <p>Please enable JavaScript to use Claude Code Manager.</p>
+  </div>
+</noscript>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

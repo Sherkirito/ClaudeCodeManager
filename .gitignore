@@ -1,0 +1,27 @@
+# Claude Code Manager — gitignore
+
+# User data (contains API keys, project paths, session summaries)
+data/api-config.json
+data/project-descriptions.json
+data/session-summaries.json
+data/summary-model.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
