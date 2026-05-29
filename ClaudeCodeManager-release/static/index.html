@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Manager</title>
+<link rel="stylesheet" href="/static/style.css?v=20260529c">
+</head>
+<body>
+<div id="app">
+  <nav class="sidebar">
+    <div class="logo"><h2>Claude Manager</h2></div>
+    <ul class="nav-list">
+      <li data-page="dashboard" class="active" onclick="CM.go('dashboard')"><span class="nav-icon">📊</span> <span>Dashboard</span></li>
+      <li data-page="projects" onclick="CM.go('projects')"><span class="nav-icon">📁</span> <span>Projects</span></li>
+      <li data-page="settings" onclick="CM.go('settings')"><span class="nav-icon">⚙️</span> <span>Settings</span></li>
+    </ul>
+    <div class="sidebar-ql" id="sidebar-ql">
+      <button class="btn-ql-launch" onclick="CM.quickLaunch()">打开 Claude Code</button>
+      <div class="ql-options">
+        <select id="sidebar-ql-path" onchange="CM.onSidebarQlPath()">
+          <option value="default">默认位置</option>
+          <option value="custom">选择文件夹...</option>
+        </select>
+        <select id="sidebar-ql-perm" onchange="CM.onSidebarQlPerm()">
+          <option value="read">仅阅读</option>
+          <option value="write">文件编辑</option>
+          <option value="std" selected>标准权限</option>
+          <option value="full">完全控制</option>
+        </select>
+      </div>
+    </div>
+    <div class="sidebar-toolbar">
+      <div class="sidebar-search"><input id="sidebar-q" placeholder="搜索 AI 总结..." onkeydown="if(event.key==='Enter')CM.go('search',this.value)"></div>
+      <div class="sidebar-back" id="sidebar-back"><a href="#" onclick="CM.goBack();return false">返回</a></div>
+    </div>
+    <div class="sidebar-footer"><small>v1.3</small></div>
+  </nav>
+  <main class="content">
+    <div id="page-content">
+      <div class="loading"><div class="spinner"></div><p>Loading...</p></div>
+    </div>
+  </main>
+</div>
+
+<noscript>
+  <div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-family:sans-serif;">
+    <h1>JavaScript Required</h1>
+    <p>Please enable JavaScript to use Claude Code Manager.</p>
+  </div>
+</noscript>
+
+<script src="/static/app.js?v=20260529c"></script>
+</body>
+</html>

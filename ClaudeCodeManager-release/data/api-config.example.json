@@ -1,0 +1,6 @@
+{
+  "provider": "deepseek",
+  "api_key": "sk-your-api-key-here",
+  "api_endpoint": "https://api.deepseek.com/v1/chat/completions",
+  "api_model": "deepseek-v4-flash"
+}
