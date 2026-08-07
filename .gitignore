@@ -5,9 +5,25 @@ data/api-config.json
 data/project-descriptions.json
 data/session-summaries.json
 data/summary-model.json
+data/path-mappings.json
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/trash/
+data/migrations/
+data/webview/
+
+# Local-only notes and packaging outputs
+HANDOFF.md
+ClaudeCodeManager/
+package-build/
+tmp/
+assets/app-icon-v*.png
+assets/*-preview.png
 
 # Python
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 
@@ -15,7 +31,18 @@ __pycache__/
 build/
 dist/
 *.spec
+!ClaudeCodeManager.spec
 *.exe
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
 
 # IDE
 .idea/
