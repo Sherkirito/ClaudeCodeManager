@@ -1,55 +1,120 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Manager</title>
-<link rel="stylesheet" href="/static/style.css?v=20260529c">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Claude Code 管理器</title>
+  <link rel="icon" type="image/png" href="/static/app-icon.png?v=20260716-icon-v3">
+  <link rel="stylesheet" href="/static/style.css?v=20260804-api-usage">
 </head>
 <body>
-<div id="app">
-  <nav class="sidebar">
-    <div class="logo"><h2>Claude Manager</h2></div>
-    <ul class="nav-list">
-      <li data-page="dashboard" class="active" onclick="CM.go('dashboard')"><span class="nav-icon">📊</span> <span>Dashboard</span></li>
-      <li data-page="projects" onclick="CM.go('projects')"><span class="nav-icon">📁</span> <span>Projects</span></li>
-      <li data-page="settings" onclick="CM.go('settings')"><span class="nav-icon">⚙️</span> <span>Settings</span></li>
-    </ul>
-    <div class="sidebar-ql" id="sidebar-ql">
-      <button class="btn-ql-launch" onclick="CM.quickLaunch()">打开 Claude Code</button>
-      <div class="ql-options">
-        <select id="sidebar-ql-path" onchange="CM.onSidebarQlPath()">
-          <option value="default">默认位置</option>
-          <option value="custom">选择文件夹...</option>
-        </select>
-        <select id="sidebar-ql-perm" onchange="CM.onSidebarQlPerm()">
-          <option value="read">仅阅读</option>
-          <option value="write">文件编辑</option>
-          <option value="std" selected>标准权限</option>
-          <option value="full">完全控制</option>
-        </select>
+  <div class="app-shell" id="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><img src="/static/app-icon.png?v=20260716-icon-v3" alt=""></span>
+        <span><strong>Claude Code</strong><small>本地记录管理器</small></span>
       </div>
-    </div>
-    <div class="sidebar-toolbar">
-      <div class="sidebar-search"><input id="sidebar-q" placeholder="搜索 AI 总结..." onkeydown="if(event.key==='Enter')CM.go('search',this.value)"></div>
-      <div class="sidebar-back" id="sidebar-back"><a href="#" onclick="CM.goBack();return false">返回</a></div>
-    </div>
-    <div class="sidebar-footer"><small>v1.3</small></div>
-  </nav>
-  <main class="content">
-    <div id="page-content">
-      <div class="loading"><div class="spinner"></div><p>Loading...</p></div>
-    </div>
-  </main>
-</div>
 
-<noscript>
-  <div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-family:sans-serif;">
-    <h1>JavaScript Required</h1>
-    <p>Please enable JavaScript to use Claude Code Manager.</p>
+      <nav class="primary-nav" id="primary-nav">
+        <button class="nav-item is-active" type="button" data-route="dashboard">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
+          <span>工作台</span>
+        </button>
+        <button class="nav-item" type="button" data-route="projects">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h7l2-2h9v13H3z"/><path d="M3 9h18"/></svg>
+          <span>项目列表</span>
+        </button>
+        <button class="nav-item" type="button" data-route="sessions">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3z"/><path d="M8 9h8M8 12h5"/></svg>
+          <span>跨项目会话</span>
+        </button>
+        <button class="nav-item" type="button" data-route="settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+          <span>系统设置</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-status" aria-label="服务状态">
+        <p class="status-heading">本地环境</p>
+        <div class="status-row"><span class="status-dot is-pending" id="claude-status-dot"></span><span>Claude CLI</span><strong id="claude-status-text">检测中</strong></div>
+        <div class="status-row"><span class="status-dot is-pending" id="ai-status-dot"></span><span>AI 服务</span><strong id="ai-status-text">检测中</strong></div>
+        <p class="version">v2.0 preview.12</p>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="global-header">
+        <nav class="breadcrumbs" id="breadcrumbs" aria-label="面包屑"></nav>
+        <form class="global-search" id="global-search" role="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+          <input id="global-search-input" name="q" type="search" autocomplete="off" placeholder="搜索项目、会话和消息…" aria-label="全局搜索">
+          <kbd>Enter</kbd>
+        </form>
+        <div class="global-actions">
+          <button class="button button-primary button-compact" type="button" data-action="open-quick-launch">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 3-8 11h7l-1 7 8-11h-7z"/></svg>
+            启动 Claude
+          </button>
+          <div class="shutdown-wrap">
+            <button class="icon-button" id="shutdown-menu-button" type="button" aria-label="关闭管理器" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9"/><path d="M6.7 5.7a8 8 0 1 0 10.6 0"/></svg>
+            </button>
+            <div class="shutdown-popover" id="shutdown-popover" hidden>
+              <strong>关闭本地管理器？</strong>
+              <p>独立窗口和本地后台服务将一并关闭。</p>
+              <div><button class="button button-ghost button-small" type="button" data-action="cancel-shutdown">取消</button><button class="button button-danger button-small" type="button" data-action="confirm-shutdown">确认关闭</button></div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="page-scroll" id="page-scroll">
+        <div class="page" id="page-content" aria-live="polite"></div>
+      </main>
+    </div>
   </div>
-</noscript>
 
-<script src="/static/app.js?v=20260529c"></script>
+  <dialog class="modal launch-modal" id="launch-dialog" aria-labelledby="launch-title">
+    <form method="dialog" id="launch-form">
+      <div class="modal-head">
+        <div class="modal-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 3-8 11h7l-1 7 8-11h-7z"/></svg></div>
+        <div><span class="eyebrow">统一启动中心</span><h2 id="launch-title">启动 Claude Code</h2><p id="launch-context-label"></p></div>
+        <button class="icon-button" value="cancel" type="submit" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <div class="launch-context-card" id="launch-context-card"></div>
+        <div class="field-row">
+          <label class="field field-grow"><span>工作目录</span><input id="launch-path" type="text" spellcheck="false" autocomplete="off"></label>
+          <button class="button button-secondary pick-folder-button" id="launch-pick-folder" type="button" data-action="pick-launch-folder">选择目录</button>
+        </div>
+        <fieldset class="permission-fieldset">
+          <legend>权限模式</legend>
+          <div class="permission-grid" id="launch-permissions"></div>
+        </fieldset>
+        <div class="command-preview"><span>启动参数</span><code id="permission-preview">使用 Claude Code 默认权限</code></div>
+        <div class="inline-alert alert-warning" id="launch-migration-warning" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg>
+          <div><strong>需要先迁移会话</strong><p>检测到项目已映射到新位置，但此会话尚未迁移。请前往项目的“位置与迁移”页签完成迁移后再恢复。</p><button class="text-button" type="button" data-action="go-to-migration">前往位置与迁移 →</button></div>
+        </div>
+        <p class="form-error" id="launch-error" role="alert" hidden></p>
+      </div>
+      <div class="modal-foot"><button class="button button-ghost" value="cancel" type="submit">取消</button><button class="button button-primary" id="launch-submit" type="button" data-action="submit-launch">启动 Claude Code</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal confirm-modal" id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <div class="modal-head compact"><div class="modal-icon is-danger" id="confirm-icon"><svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg></div><div><span class="eyebrow" id="confirm-eyebrow">安全确认</span><h2 id="confirm-title">确认操作</h2></div></div>
+      <div class="modal-body"><p class="confirm-message" id="confirm-message"></p><div class="confirm-detail" id="confirm-detail" hidden></div></div>
+      <div class="modal-foot"><button class="button button-ghost" value="cancel" type="submit">取消</button><button class="button button-danger" id="confirm-submit" value="confirm" type="submit">确认</button></div>
+    </form>
+  </dialog>
+
+  <div class="global-loader" id="global-loader" hidden aria-live="assertive"><div class="loader-card"><span class="spinner"></span><strong id="global-loader-title">处理中</strong><p id="global-loader-detail">请稍候…</p></div></div>
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <noscript><div class="noscript"><h1>需要启用 JavaScript</h1><p>Claude Code 管理器需要 JavaScript 才能运行。</p></div></noscript>
+  <script type="module" src="/static/app.js?v=20260804-api-usage"></script>
 </body>
 </html>
