@@ -129,6 +129,8 @@ const state = {
   launchContexts: new Map(),
   launchContext: null,
   launchCounter: 0,
+  usagePollTimer: null,
+  usagePollInFlight: false,
   projects: { q: "", drive: "", sort: "active", offset: 0, limit: 50, dirParts: [], data: null, dirs: null },
   sessions: { q: "", offset: 0, limit: 60 },
   selectedProjects: new Set(),
@@ -150,6 +152,10 @@ function formatNumber(value) {
   return String(n);
 }
 function formatExactNumber(value) { return Number(value || 0).toLocaleString("zh-CN"); }
+function formatUsd(value) {
+  const amount = Number(value || 0);
+  return `US$${amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+}
 function shortPath(value) {
   const clean = String(value || "").replace(/\//g, "\\").replace(/\\+$/, "");
   return clean.split("\\").pop() || clean || "未命名";
@@ -419,6 +425,7 @@ function navigate(route, params = {}, { push = true, scroll = true } = {}) {
 }
 
 async function renderCurrentPage() {
+  stopUsagePolling();
   const token = ++state.renderToken;
   state.launchContexts.clear();
   skeletonPage();
@@ -444,7 +451,19 @@ async function renderDashboard(token) {
   const primaryMessages = stats.total_primary_messages ?? stats.total_messages ?? 0;
   const automaticMessages = stats.total_automatic_messages ?? 0;
   const apiTokens = stats.api_tokens_30d ?? 0;
-  const apiResponses = stats.api_unique_responses_30d ?? 0;
+  const usageSource = data.usage_source || { id: "local_index", exact: false };
+  const apiResponses = stats.api_request_count_30d ?? stats.api_unique_responses_30d ?? 0;
+  const usageCard = statCard(
+    "近 30 天 Token",
+    formatNumber(apiTokens),
+    usageSource.id === "cc_switch"
+      ? `CC Switch 计费 · 每分钟更新 · ${formatExactNumber(apiResponses)} 个请求 · ${formatUsd(stats.api_cost_usd_30d)}`
+      : `本机日志估算，含缓存 · ${formatExactNumber(apiResponses)} 个唯一响应`,
+    "token"
+  );
+  usageCard.id = "dashboard-usage-stat";
+  const usagePanel = renderApiUsage(data.api_usage || [], data.api_usage_period || {}, usageSource);
+  usagePanel.id = "dashboard-usage-panel";
   const list = h("div", { className: "list" });
   const recent = data.recent_sessions || [];
   recent.forEach((session) => list.append(...sessionEntry(session)));
@@ -455,38 +474,84 @@ async function renderDashboard(token) {
       statCard("项目", formatExactNumber(stats.total_projects), "已建立本地索引", "folder"),
       statCard("主会话", formatExactNumber(stats.total_sessions), `自动/下属另计 ${formatExactNumber(stats.total_automatic_sessions)} 个`, "message"),
       statCard("主会话记录", formatExactNumber(primaryMessages), `本地 user/assistant 记录；自动任务另计 ${formatExactNumber(automaticMessages)} 条`, "database"),
-      statCard("近 30 天 Token", formatNumber(apiTokens), `全部本机模型，含缓存 · ${formatExactNumber(apiResponses)} 个唯一响应`, "token")
+      usageCard
     ),
-    h("div", { className: "dashboard-grid" }, renderApiUsage(data.api_usage || [], data.api_usage_period || {}), panel("最近会话", "按最后活跃时间排序", list))
+    h("div", { className: "dashboard-grid" }, usagePanel, panel("最近会话", "按最后活跃时间排序", list))
   );
+  scheduleUsagePolling();
 }
 
-function renderApiUsage(rows, period) {
+function renderApiUsage(rows, period, source = {}) {
   const range = period.start && period.end ? `${period.start} 至 ${period.end}` : "近 30 个自然日";
-  const body = h("div", { className: "usage-summary" });
+  const fromCcSwitch = source.id === "cc_switch";
+  const body = h("div", { className: `usage-summary${fromCcSwitch ? " is-cc-switch" : ""}` });
   if (!rows.length) {
-    body.append(emptyState("暂无 API 用量", "刷新索引后，将从本机保留的会话日志中统计。", "activity"));
-    return panel("本机 API 用量", `${range} · 按唯一响应去重`, body);
+    body.append(emptyState("暂无 API 用量", fromCcSwitch ? "CC Switch 在此时间范围内没有 Claude Code 计费记录。" : "刷新索引后，将从本机保留的会话日志中统计。", "activity"));
+    return panel(fromCcSwitch ? "CC Switch · Claude Code 用量" : "本机 API 用量", `${range} · ${fromCcSwitch ? "精确计费记录" : "按唯一响应去重"}`, body);
   }
   body.append(h("div", { className: "usage-head" },
     h("span", { text: "模型" }),
-    h("span", { text: "唯一响应" }),
+    h("span", { text: fromCcSwitch ? "计费请求" : "唯一响应" }),
     h("span", { text: "Token（含缓存）" })
   ));
   rows.forEach((row) => {
     const inputOutput = Number(row.input_tokens || 0) + Number(row.output_tokens || 0);
     const cache = Number(row.cache_creation_tokens || 0) + Number(row.cache_read_tokens || 0);
+    const requestCount = row.request_count ?? row.unique_responses ?? 0;
+    const costText = fromCcSwitch ? ` · 费用 ${formatUsd(row.total_cost_usd)}` : "";
     body.append(h("div", { className: "usage-row" },
       h("div", { className: "usage-model" },
         h("strong", { text: row.model || "unknown" }),
-        h("small", { text: `输入+输出 ${formatExactNumber(inputOutput)} · 缓存 ${formatExactNumber(cache)}` })
+        h("small", { text: `输入+输出 ${formatExactNumber(inputOutput)} · 缓存 ${formatExactNumber(cache)}${costText}` })
       ),
-      h("strong", { className: "usage-responses", text: formatExactNumber(row.unique_responses) }),
+      h("strong", { className: "usage-responses", text: formatExactNumber(requestCount) }),
       h("strong", { className: "usage-tokens", text: formatExactNumber(row.total_tokens) })
     ));
   });
-  body.append(h("p", { className: "usage-note", text: "本机日志估算：Token 已按响应 ID 去重，并包含输入、输出、缓存创建与缓存读取。供应商后台还可能包含其他设备、已删除会话或不同请求口径。" }));
-  return panel("本机 API 用量", `${range} · 按唯一响应去重`, body);
+  const syncText = source.updated_at ? ` 最近记录 ${String(source.updated_at).replace("T", " ").slice(0, 19)}。` : "";
+  body.append(h("p", { className: "usage-note", text: fromCcSwitch
+    ? `直接读取 CC Switch：仅统计 app_type=claude（Claude Code）的 ${source.data_source || "usage"} 计费记录，已排除 Codex 与 Claude Desktop；Token 为输入、输出、缓存创建、缓存读取之和。每分钟自动更新。${syncText}`
+    : "本机日志估算：Token 已按响应 ID 去重，并包含输入、输出、缓存创建与缓存读取。供应商后台还可能包含其他设备、已删除会话或不同请求口径。" }));
+  return panel(fromCcSwitch ? "CC Switch · Claude Code 用量" : "本机 API 用量", `${range} · ${fromCcSwitch ? "精确计费记录" : "按唯一响应去重"}`, body);
+}
+
+function stopUsagePolling() {
+  if (state.usagePollTimer) window.clearTimeout(state.usagePollTimer);
+  state.usagePollTimer = null;
+}
+
+function scheduleUsagePolling() {
+  stopUsagePolling();
+  if (state.route !== "dashboard") return;
+  state.usagePollTimer = window.setTimeout(refreshDashboardUsage, 60000);
+}
+
+async function refreshDashboardUsage() {
+  state.usagePollTimer = null;
+  if (state.route !== "dashboard" || state.usagePollInFlight) return;
+  state.usagePollInFlight = true;
+  try {
+    const usage = await api("/api/v2/usage");
+    if (state.route !== "dashboard" || !usage.available) return;
+    const totals = usage.totals || {};
+    const card = $("#dashboard-usage-stat");
+    if (card) {
+      const value = $("strong", card);
+      const hint = $("small", card);
+      if (value) value.textContent = formatNumber(totals.total_tokens);
+      if (hint) hint.textContent = `CC Switch 计费 · 每分钟更新 · ${formatExactNumber(totals.request_count)} 个请求 · ${formatUsd(totals.total_cost_usd)}`;
+    }
+    const currentPanel = $("#dashboard-usage-panel");
+    if (currentPanel) {
+      const nextPanel = renderApiUsage(usage.items || [], usage.period || {}, usage.source || {});
+      nextPanel.id = "dashboard-usage-panel";
+      currentPanel.replaceWith(nextPanel);
+    }
+  } catch { /* keep the last confirmed billing snapshot */ }
+  finally {
+    state.usagePollInFlight = false;
+    if (state.route === "dashboard") scheduleUsagePolling();
+  }
 }
 
 async function renderProjects(token) {
@@ -727,16 +792,21 @@ async function renderSession(token, projectId, sessionId) {
   const isPrimary = (session.session_kind || "primary") === "primary" && !session.parent_session_id;
   const recordProjectId = session.record_project_id || projectId;
   const projectPath = session.project_name || session.cwd_initial || session.cwd || projectId;
+  const sessionDirectory = session.cwd || session.cwd_initial || projectPath;
+  const sessionDirectoryMapping = findProjectPathMapping(sessionDirectory);
+  const openSessionDirectory = sessionDirectoryMapping && !isMappingTarget(sessionDirectory, sessionDirectoryMapping)
+    ? mappedPath(sessionDirectory, sessionDirectoryMapping)
+    : sessionDirectory;
   state.projectNames.set(projectId, projectPath);
   setBreadcrumbs([{ label: "项目列表", route: "projects" }, { label: shortPath(projectPath), route: "project", projectId, projectPath }, { label: `会话：${session.title || sessionId}` }]);
   const launchKey = isPrimary ? registerLaunchContext({ kind: "session", projectId: recordProjectId, logicalProjectId: projectId, sessionId, path: session.cwd_initial || session.cwd || projectPath, label: session.title || sessionId }) : "";
   const roleButtons = h("div", { className: "segmented" });
   [["", "全部"], ["user", "用户"], ["assistant", "助手"]].forEach(([role, label]) => roleButtons.append(h("button", { type: "button", className: `segmented-button${view.role === role ? " is-active" : ""}`, text: label, dataset: { action: "message-role", role, projectId, sessionId } })));
   const messages = h("div", { className: "message-list" });
-  (data.messages || []).forEach((message) => messages.append(messageBlock(message)));
+  appendConversationMessages(messages, data.messages || []);
   if (!(data.messages || []).length) messages.append(emptyState("没有匹配消息", "此角色筛选下没有可显示的消息。", "message"));
   const reader = h("section", { className: "panel" },
-    h("div", { className: "reader-toolbar" }, h("div", {}, h("strong", { text: "消息阅读器" })), roleButtons),
+    h("div", { className: "reader-toolbar" }, h("div", {}, h("strong", { text: "消息阅读器" }), h("small", { text: "阅读优先 · Agent 操作默认折叠" })), roleButtons),
     messages,
     pager(data.total || 0, data.offset || 0, data.limit || view.limit, "messages", projectId)
   );
@@ -746,7 +816,7 @@ async function renderSession(token, projectId, sessionId) {
     h("div", {}, h("strong", { text: sessionKindLabel(session.session_kind) }), h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : "这是自动创建的会话，目前没有足够证据确定母会话。" })),
     session.parent ? button("查看母会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: session.parent.project_id, sessionId: session.parent.id } }) : null
   ) : h("div", { hidden: true });
-  const actions = [];
+  const actions = [button("打开所在文件夹", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openSessionDirectory } })];
   if (isPrimary) actions.push(button("生成总结", "summarize-session", { kind: "secondary", iconName: "spark", dataset: { projectId: recordProjectId, sessionId } }), button("恢复会话", "open-launch", { kind: "primary", iconName: "play", dataset: { launchKey } }), button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId: recordProjectId, logicalProjectId: projectId, sessionId } }));
   pageRoot.replaceChildren(
     pageHeading("Session", session.title || sessionId, isPrimary ? "按角色进行服务端分页，工具调用默认折叠。" : "自动会话仅供查看，默认不提供恢复和删除操作。", actions),
@@ -766,8 +836,233 @@ async function renderSession(token, projectId, sessionId) {
 
 function summaryMetric(label, value) { return h("div", { className: "summary-metric" }, h("span", { text: label }), h("strong", { text: value })); }
 
-function messageBlock(message) {
-  const original = String(message.text || "");
+function appendConversationMessages(container, messages) {
+  let pendingActions = [];
+  const flushActions = () => {
+    if (!pendingActions.length) return;
+    container.append(agentActionGroup(pendingActions));
+    pendingActions = [];
+  };
+  messages.forEach((message) => {
+    messageSegments(message).forEach((segment) => {
+      if (segment.type === "action") {
+        pendingActions.push(segment.action);
+        return;
+      }
+      flushActions();
+      if (segment.text.trim()) container.append(messageBlock(message, segment.text));
+    });
+  });
+  flushActions();
+}
+
+function messageSegments(message) {
+  const fallback = String(message.text || "");
+  let content = null;
+  try { content = JSON.parse(message.content_json || "null"); } catch { /* use indexed text */ }
+  if (typeof content === "string") return content ? [machineContextSegment(content, message) || { type: "text", text: content }] : [];
+  if (!Array.isArray(content)) return fallback ? legacyMessageSegments(message, fallback) : [];
+
+  const segments = [];
+  const pushText = (value) => {
+    const text = String(value || "");
+    if (!text) return;
+    const previous = segments[segments.length - 1];
+    if (previous?.type === "text") previous.text += `\n${text}`;
+    else segments.push({ type: "text", text });
+  };
+  content.forEach((block) => {
+    if (!block || typeof block !== "object") return;
+    if (block.type === "text") {
+      const contextSegment = machineContextSegment(block.text, message);
+      if (contextSegment) segments.push(contextSegment);
+      else pushText(block.text);
+      return;
+    }
+    if (block.type === "tool_use") {
+      segments.push({ type: "action", action: {
+        kind: "tool_use",
+        id: String(block.id || ""),
+        name: String(block.name || "tool"),
+        input: block.input ?? {},
+        timestamp: message.timestamp || ""
+      } });
+      return;
+    }
+    if (block.type === "tool_result") {
+      segments.push({ type: "action", action: {
+        kind: "tool_result",
+        toolUseId: String(block.tool_use_id || ""),
+        content: block.content ?? "",
+        isError: Boolean(block.is_error),
+        timestamp: message.timestamp || ""
+      } });
+    }
+  });
+  return segments.length ? segments : (fallback ? legacyMessageSegments(message, fallback) : []);
+}
+
+function legacyMessageSegments(message, raw) {
+  const contextSegment = machineContextSegment(raw, message);
+  if (contextSegment) return [contextSegment];
+  if (/^\s*\[(tool_use|tool_result)\]/.test(raw)) {
+    const firstLine = raw.split("\n", 1)[0];
+    const match = firstLine.match(/^\s*\[(tool_use|tool_result)\]\s*([^\s]*)\s*(.*)$/);
+    return [{ type: "action", action: {
+      kind: match?.[1] || "tool_result",
+      id: "",
+      toolUseId: "",
+      name: match?.[2] || "tool",
+      input: match?.[3] || "",
+      content: raw,
+      isError: false,
+      timestamp: message.timestamp || ""
+    } }];
+  }
+  return [{ type: "text", text: raw }];
+}
+
+function machineContextSegment(value, message) {
+  const raw = String(value || "").trim();
+  let name = "";
+  if (/^<local-command-caveat(?:\s[^>]*)?>[\s\S]*<\/local-command-caveat>\s*$/i.test(raw)) name = "local-command-caveat";
+  else if (/^<command-name(?:\s[^>]*)?>[\s\S]*<\/command-name>(?:\s*<(?:command-message|command-args)(?:\s[^>]*)?>[\s\S]*<\/(?:command-message|command-args)>)*\s*$/i.test(raw)) name = "command-name";
+  else if (/^<local-command-stdout(?:\s[^>]*)?>[\s\S]*<\/local-command-stdout>\s*$/i.test(raw)) name = "local-command-stdout";
+  else if (/^<local-command-stderr(?:\s[^>]*)?>[\s\S]*<\/local-command-stderr>\s*$/i.test(raw)) name = "local-command-stderr";
+  else if (/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder>\s*$/i.test(raw)) name = "system-reminder";
+  if (!name) return null;
+  return { type: "action", action: {
+    kind: "context",
+    name,
+    content: raw,
+    timestamp: message.timestamp || "",
+    isError: name === "local-command-stderr"
+  } };
+}
+
+function agentActionGroup(actions) {
+  const entries = pairAgentActions(actions);
+  const calls = entries.filter((entry) => entry.kind === "tool_use");
+  const commandCalls = calls.filter((entry) => isCommandTool(entry.name));
+  const count = entries.length;
+  const contextOnly = entries.every((entry) => entry.kind === "context");
+  const label = contextOnly
+    ? `上下文与本地命令记录 ${count} 项`
+    : (calls.length > 0 && commandCalls.length === calls.length
+      ? `运行了 ${calls.length} 个命令`
+      : `Agent 执行了 ${count} 项操作`);
+  const details = h("details", { className: "agent-action-group" },
+    h("summary", {}, icon("terminal"), h("span", { text: label }), h("small", { text: "默认折叠" }))
+  );
+  const list = h("div", { className: "agent-action-list" });
+  entries.forEach((entry) => list.append(agentActionEntry(entry)));
+  details.append(list);
+  return details;
+}
+
+function pairAgentActions(actions) {
+  const entries = [];
+  const callsById = new Map();
+  actions.forEach((action) => {
+    if (action.kind === "tool_use") {
+      const entry = { ...action, results: [] };
+      entries.push(entry);
+      if (entry.id) callsById.set(entry.id, entry);
+      return;
+    }
+    const call = action.toolUseId ? callsById.get(action.toolUseId) : null;
+    if (call) call.results.push(action);
+    else entries.push({ ...action, results: [] });
+  });
+  return entries;
+}
+
+function isCommandTool(name) {
+  return /^(bash|shell|shell_command|exec|exec_command|terminal|run_command)$/i.test(String(name || ""));
+}
+
+function agentActionEntry(entry) {
+  const failed = entry.isError || (entry.results || []).some((result) => result.isError);
+  const details = h("details", { className: `agent-action${failed ? " is-error" : ""}` },
+    h("summary", {}, icon(actionIcon(entry.name)), h("span", { text: actionTitle(entry) }), failed ? h("small", { text: "失败" }) : null)
+  );
+  const body = h("div", { className: "agent-action-body" });
+  if (entry.kind === "tool_use") {
+    const input = formatStructuredValue(entry.input);
+    body.append(actionPayload("调用参数", input || "（无参数）"));
+    if ((entry.results || []).length) {
+      (entry.results || []).forEach((result, index) => body.append(actionPayload(entry.results.length > 1 ? `执行结果 ${index + 1}` : "执行结果", formatToolResult(result.content) || "（无输出）", result.isError)));
+    } else {
+      body.append(actionPayload("执行结果", "当前记录中未找到对应结果。"));
+    }
+  } else if (entry.kind === "context") {
+    body.append(actionPayload("记录内容", entry.content || "（无内容）", entry.isError));
+  } else {
+    body.append(actionPayload("工具结果", formatToolResult(entry.content) || "（无输出）", entry.isError));
+  }
+  details.append(body);
+  return details;
+}
+
+function actionPayload(label, value, isError = false) {
+  const raw = String(value || "");
+  const truncated = raw.length > 16000;
+  return h("section", { className: `agent-action-payload${isError ? " is-error" : ""}` },
+    h("span", { text: label }),
+    h("pre", {}, h("code", { text: truncated ? `${raw.slice(0, 16000)}\n…（内容过长，已截断）` : raw }))
+  );
+}
+
+function actionIcon(name) {
+  if (isCommandTool(name)) return "terminal";
+  if (/^(read|write|edit|glob|grep)$/i.test(String(name || ""))) return "folder";
+  return "activity";
+}
+
+function actionTitle(entry) {
+  if (entry.kind === "context") {
+    if (entry.name === "local-command-caveat") return "本地命令上下文提示";
+    if (entry.name === "local-command-stdout") return "本地命令输出";
+    if (entry.name === "local-command-stderr") return "本地命令错误输出";
+    if (entry.name === "system-reminder") return "系统上下文提示";
+    const commandName = String(entry.content || "").match(/<command-name>([\s\S]*?)<\/command-name>/i)?.[1]?.trim();
+    return commandName ? `本地命令 ${commandName}` : "本地命令记录";
+  }
+  if (entry.kind !== "tool_use") return entry.isError ? "工具返回了错误" : "工具返回了结果";
+  const name = String(entry.name || "tool");
+  const input = entry.input && typeof entry.input === "object" ? entry.input : {};
+  const command = input.command || input.cmd || (typeof entry.input === "string" ? entry.input : "");
+  const path = input.file_path || input.path || input.cwd || "";
+  const pattern = input.pattern || input.query || input.glob || "";
+  let title = `已调用 ${name}`;
+  if (isCommandTool(name)) title = `已运行 ${command || name}`;
+  else if (/^read$/i.test(name)) title = `已读取 ${path || "文件"}`;
+  else if (/^(write|edit)$/i.test(name)) title = `已修改 ${path || "文件"}`;
+  else if (/^grep$/i.test(name)) title = `已搜索 ${pattern || "文本"}`;
+  else if (/^glob$/i.test(name)) title = `已查找文件 ${pattern || "路径"}`;
+  else if (/^(websearch|web_search)$/i.test(name)) title = `已搜索网页 ${pattern || ""}`;
+  else if (/^(task|agent)$/i.test(name)) title = `已启动 Agent ${input.description || input.prompt || ""}`;
+  return title.length > 190 ? `${title.slice(0, 187)}…` : title;
+}
+
+function formatStructuredValue(value) {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value ?? {}, null, 2); } catch { return String(value ?? ""); }
+}
+
+function formatToolResult(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return formatStructuredValue(content);
+  return content.map((item) => {
+    if (typeof item === "string") return item;
+    if (item?.type === "text") return String(item.text || "");
+    if (item?.type === "image") return "[图片结果]";
+    return formatStructuredValue(item);
+  }).filter(Boolean).join("\n");
+}
+
+function messageBlock(message, rawOverride = null) {
+  const original = rawOverride === null ? String(message.text || "") : String(rawOverride || "");
   const truncated = original.length > 16000;
   const raw = truncated ? original.slice(0, 16000) : original;
   const role = message.role === "user" ? "user" : "assistant";
@@ -779,18 +1074,9 @@ function messageBlock(message) {
       h("span", { text: `${formatNumber(message.total_tokens)} tokens` })
     )
   );
-  const isTool = /^\s*\[(tool_use|tool_result)\]/.test(raw);
-  if (isTool) {
-    const details = h("details", { className: "tool-detail" }, h("summary", { text: raw.split("\n")[0].slice(0, 180) || "工具调用" }));
-    const body = h("div", { className: "message-body" });
-    appendMessageContent(body, raw);
-    details.append(body);
-    article.append(details);
-  } else {
-    const body = h("div", { className: "message-body" });
-    appendMessageContent(body, raw);
-    article.append(body);
-  }
+  const body = h("div", { className: "message-body" });
+  appendMessageContent(body, raw);
+  article.append(body);
   if (truncated) article.append(h("div", { className: "truncation-note" }, icon("alert"), h("span", { text: "消息超过 16,000 字符，已在前端安全截断。" })));
   return article;
 }
@@ -869,12 +1155,19 @@ async function renderSettings(token) {
     h("p", { className: "help-text", text: "“刷新索引”只解析新增或变化的记录，适合日常使用；“完整重建”会重新解析全部 JSONL，仅用于索引损坏或升级后的深度维护。" }),
     h("div", { className: "form-actions" }, button("刷新索引", "reindex", { kind: "secondary", iconName: "refresh" }), button("完整重建", "reindex-full", { kind: "ghost", iconName: "database" }), button("为所有项目生成简介", "describe-all", { kind: "secondary", iconName: "spark" }))
   ));
+  const recordSource = settingsSection("会话记录来源", config.projects_dir_available ? "已自动发现 Claude Code 会话目录。" : "当前目录尚无 projects 子目录；启动 Claude Code 产生会话后可刷新索引。", "database", h("div", { className: "form-stack" },
+    h("div", { className: "path-pair" },
+      h("div", { className: "path-item" }, h("span", { text: "Claude 配置目录" }), h("code", { text: config.claude_dir || "未知" })),
+      h("div", { className: "path-item" }, h("span", { text: "会话记录目录" }), h("code", { text: config.projects_dir || "未知" }))
+    ),
+    h("p", { className: "help-text", text: `来源：${config.claude_dir_source || "user_home"}。优先支持 --claude-dir、CCM_CLAUDE_DIR 与 Claude Code 官方 CLAUDE_CONFIG_DIR；未配置时自动使用当前用户主目录。` })
+  ), "span-2");
   const redirects = directoryRedirectSettings(state.pathMappings);
   const appSection = settingsSection("应用与高级操作", "关闭本地 HTTP 服务的最终安全出口。", "settings", h("div", { className: "form-stack" },
     h("p", { className: "help-text", text: "关闭管理器不会删除任何项目、会话或索引数据。" }),
     h("div", { className: "form-actions" }, button("关闭管理器", "settings-shutdown", { kind: "danger", iconName: "x" }))
   ), "danger-section");
-  pageRoot.replaceChildren(pageHeading("Preferences", "系统设置", "集中管理 AI 服务、启动偏好、目录重定向、索引维护与应用操作。"), h("div", { className: "settings-grid" }, aiSection, launchSection, redirects, maintenance, appSection));
+  pageRoot.replaceChildren(pageHeading("Preferences", "系统设置", "集中管理 AI 服务、启动偏好、记录来源、目录重定向、索引维护与应用操作。"), h("div", { className: "settings-grid" }, aiSection, launchSection, recordSource, redirects, maintenance, appSection));
 }
 
 function directoryRedirectSettings(mappings) {
@@ -1376,14 +1669,14 @@ async function pollStatus() {
 }
 
 document.addEventListener("click", async (event) => {
-  const routeTarget = event.target.closest("[data-route]");
-  if (routeTarget) { navigate(routeTarget.dataset.route); return; }
   const actionTarget = event.target.closest("[data-action]");
   if (actionTarget) {
     event.preventDefault();
     try { await executeAction(actionTarget.dataset.action, actionTarget); } catch (error) { toast(error.message || "操作失败", "error"); }
     return;
   }
+  const routeTarget = event.target.closest("[data-route]");
+  if (routeTarget) { navigate(routeTarget.dataset.route); return; }
   if (!event.target.closest(".shutdown-wrap")) {
     $("#shutdown-popover").hidden = true;
     $("#shutdown-menu-button").setAttribute("aria-expanded", "false");
