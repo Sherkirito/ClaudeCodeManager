@@ -4,7 +4,7 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-EXPECTED_UI_VERSION = "v2.0 preview.12"
+EXPECTED_UI_VERSION = "v2.0 preview.14"
 
 
 def read(path):
@@ -24,6 +24,7 @@ def main():
     js = read(ROOT / "static" / "app.js")
     css = read(ROOT / "static" / "style.css")
     v2 = read(ROOT / "v2_index.py")
+    cc_usage = read(ROOT / "cc_switch_usage.py")
     spec = read(ROOT / "ClaudeCodeManager.spec")
     requirements = read(ROOT / "requirements.txt")
 
@@ -48,16 +49,25 @@ def main():
     checks.append(check("api usage schema exists", "api_usage_events" in v2 and "response_id" in v2))
     checks.append(check("dashboard API usage is deduplicated", "PARTITION BY response_id" in v2 and "按唯一响应去重" in js))
     checks.append(check("dashboard uses 30 day window", "timedelta(days=29)" in v2 and "近 30 天 Token" in js))
+    checks.append(check("CC Switch usage integration", "import cc_switch_usage" in app and "app_type = ?" in cc_usage and "CLAUDE_CODE_APP_TYPE" in cc_usage))
+    checks.append(check("CC Switch usage endpoint", 'subpath == "usage"' in app and "/api/v2/usage" in js))
+    checks.append(check("dashboard usage auto refresh", "scheduleUsagePolling" in js and "60000" in js and "每分钟" in js))
     checks.append(check("v2 soft delete exists", "/api/v2/trash-project" in app and "/api/v2/trash-session" in app))
     checks.append(check("ai actions restored", "describeProject" in js and "summarizeSession" in js and "summarizeProject" in js))
     checks.append(check("one-click descriptions visible", "一键生成全部简介" in js and "/api/describe-all" in js))
     checks.append(check("legacy API config recovery", "legacy_api_config_candidates" in app and "Recovered API configuration" in app))
     checks.append(check("API key stays masked", "api_key_masked" in app and "留空保留原密钥" in js))
     checks.append(check("permission selector restored", "const PERMISSIONS" in js and "launch-permission" in js))
-    checks.append(check("tool folding restored", "tool-detail" in js and "messageBlock" in js))
+    checks.append(check("structured Agent action folding", "appendConversationMessages" in js and "pairAgentActions" in js and "agent-action-group" in css))
+    checks.append(check("tool calls pair with results", "tool_use_id" in js and "callsById" in js and "执行结果" in js))
+    checks.append(check("human-readable messages stay visible", 'segment.type === "action"' in js and "messageBlock(message, segment.text)" in js))
+    checks.append(check("machine context folds away", "machineContextSegment" in js and "上下文与本地命令记录" in js))
     checks.append(check("directory browser restored", "project-dirs" in app and "directoryBrowser" in js and "dirParts" in js))
     checks.append(check("session list actions restored", "sessionEntry" in js and "open-launch" in js))
     checks.append(check("session row click target", 'className: `list-row${canSelect ? " has-check" : " is-clickable"}' in js and ".list-row.is-clickable" in css))
+    checks.append(check("breadcrumb actions keep project id", js.index('closest("[data-action]")') < js.index('closest("[data-route]")')))
+    checks.append(check("session folder opener", 'button("打开所在文件夹", "open-project-directory"' in js))
+    checks.append(check("portable Claude data discovery", "resolve_claude_dir" in app and "CLAUDE_CONFIG_DIR" in app and "--claude-dir" in app))
     checks.append(check("project folder opener", "/api/open-directory" in app and "open_directory_in_file_manager" in app and "open-project-directory" in js))
     checks.append(check("batch trash restored", "/api/v2/trash-projects" in app and "/api/v2/trash-sessions" in app and "trashSelectedProjects" in js and "trashSelectedSessions" in js))
     checks.append(check("sessions nav exists", "data-route=\"sessions\"" in index))
