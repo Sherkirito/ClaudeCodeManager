@@ -17,6 +17,8 @@ python app.py
 
 默认打开独立桌面窗口。若需要保留原浏览器调试方式，可执行 `python app.py --browser`。内部服务仅监听 `127.0.0.1`；如果 5141 不可用，程序会自动选择后续端口。
 
+管理器不会写死用户名或盘符。Claude Code 会话目录按以下优先级自动确定：`--claude-dir <目录>` → `CCM_CLAUDE_DIR` → Claude Code 官方 `CLAUDE_CONFIG_DIR` → 当前用户主目录下的 `.claude`。例如多账号或便携配置可执行 `python app.py --claude-dir D:\ClaudeData`；设置页会显示最终采用的配置目录和 `projects` 目录。
+
 ### 方式二：双击启动
 
 - **Windows** — 双击 `start.bat`（或 `start.vbs` 静默启动）
@@ -39,12 +41,12 @@ Windows 打包配置只保留 WebView2/WinForms 所需组件，排除了其他�
 
 | 模块 | 说明 |
 |------|------|
-| 总览仪表盘 | 项目数、会话数、消息数、Token 总量统计卡片 |
-| 日期统计 | Dashboard 按日期展示最近会话活动柱状图 |
+| 总览仪表盘 | 项目数、会话数、消息数，以及 CC Switch 的 Claude Code 精确 Token / 费用统计 |
+| 用量自动更新 | 工作台每分钟只读刷新 `~/.cc-switch/cc-switch.db`，不触发会话全量索引 |
 | 项目管理 | 自动识别工作目录，AI 生成 2-3 句中文项目简介 |
 | 目录快速定位 | 项目列表可按真实路径逐层进入目录，并支持路径关键词过滤 |
 | 项目筛选排序 | 项目列表支持按盘符分类，并按活跃时间、名称、会话数、Token 排序 |
-| 会话查看 | 完整对话回放，代码块高亮，Agent 工具调用折叠显示 |
+| 会话查看 | 阅读优先的完整对话回放；用户消息与助手正文直接显示，连续 Agent 操作默认汇总折叠，并可逐项展开参数与结果 |
 | AI 总结 | 项目级简介 + 会话级详细总结，支持 DeepSeek / Anthropic |
 | 侧边栏快速启动 | 路径 + 4 种权限模式，随时一键打开 Claude Code |
 | 权限选择 | 侧边栏、项目页、会话页均可选择打开权限 |
@@ -99,6 +101,7 @@ ClaudeCodeManager/
 ├── .gitignore
 ├── README.md
 ├── v2_index.py            # SQLite/FTS5 增量索引和 v2 查询 API 支撑
+├── cc_switch_usage.py      # 只读 CC Switch 的 Claude Code 计费记录
 ├── assets/
 │   ├── app-icon.ico       # EXE 图标
 │   ├── app-icon.png       # 图标预览
@@ -148,7 +151,7 @@ ClaudeCodeManager/
 
 ## 数据说明
 
-所有数据从 `~/.claude/projects/` 本地读取，**不会上传至任何外部服务**。AI 总结功能仅在用户主动点击按钮时调用配置的 API。
+默认从当前用户的 `~/.claude/projects/` 读取本地记录；设置了 `CLAUDE_CONFIG_DIR`、`CCM_CLAUDE_DIR` 或 `--claude-dir` 时会自动改用对应目录。**会话记录不会上传至任何外部服务**。AI 总结功能仅在用户主动点击按钮时调用配置的 API。
 
 配置、AI 摘要、回收站等持久化文件保存在运行方式对应的 `data/` 目录：
 
@@ -166,9 +169,12 @@ SQLite 索引不再跟随运行目录保存。源码版和打包版统一使用 
 | `session-summaries.json` | AI 生成的会话总结缓存 |
 | `path-mappings.json` | 项目旧路径到新路径的映射 |
 | `%LOCALAPPDATA%\ClaudeCodeManager\manager-index.sqlite3` | 源码版与打包版共用的 v2 SQLite/FTS5 索引缓存，可删除后自动重建 |
+| `~/.cc-switch/cc-switch.db` | CC Switch 数据库；管理器只读 `app_type=claude` 的计费记录，不读取供应商密钥 |
 | `webview/` | 独立窗口的 WebView2 本地存储和浏览数据 |
 
 v2 索引只缓存从本地 JSONL 解析出的项目、会话、消息文本和统计信息。删除该数据库不会删除 Claude Code 原始记录。日常“刷新索引”只解析新增或变化的 JSONL；设置页的“完整重建”才会重新解析全部记录。
+
+工作台用量优先读取 CC Switch 的 `proxy_request_logs`：`app_type=claude` 代表 Claude Code，`codex` 与 `claude-desktop` 不会混入。存在 `session_log` 时优先采用该来源，避免与代理日志重复累计；CC Switch 不可用时才回退到管理器自身的 JSONL 去重估算。
 
 性能方面，后端使用多线程 loopback HTTP 服务，耗时的索引或 AI 请求不会再阻塞其他页面请求；静态资源使用内存缓存和 ETag；增量扫描会一次性预取文件签名，未发生会话变化时跳过项目关系和统计的全量重算。
 

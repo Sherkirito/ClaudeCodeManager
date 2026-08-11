@@ -23,15 +23,51 @@ import traceback
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
+import cc_switch_usage
 import v2_index
 
 _VALID_ID = re.compile(r"^[a-zA-Z0-9._\-]+$")
 MAX_POST_BODY = 64 * 1024  # 64 KB max request body
 
+
+def resolve_claude_dir(argv=None, environ=None, home=None):
+    """Resolve Claude Code's data directory without machine-specific paths."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    env = os.environ if environ is None else environ
+    cli_value = ""
+    for index, arg in enumerate(args):
+        if arg == "--claude-dir":
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                raise ValueError("--claude-dir requires a directory path")
+            cli_value = args[index + 1].strip()
+            break
+        if arg.startswith("--claude-dir="):
+            cli_value = arg.split("=", 1)[1].strip()
+            if not cli_value:
+                raise ValueError("--claude-dir requires a directory path")
+            break
+
+    value = cli_value
+    source = "cli"
+    if not value:
+        value = str(env.get("CCM_CLAUDE_DIR", "")).strip()
+        source = "CCM_CLAUDE_DIR"
+    if not value:
+        value = str(env.get("CLAUDE_CONFIG_DIR", "")).strip()
+        source = "CLAUDE_CONFIG_DIR"
+    if not value:
+        value = os.path.join(home or os.path.expanduser("~"), ".claude")
+        source = "user_home"
+
+    if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+        value = os.path.join(home or os.path.expanduser("~"), value[2:]) if value != "~" else (home or os.path.expanduser("~"))
+    value = os.path.expandvars(value)
+    return os.path.realpath(os.path.abspath(value)), source
+
 # =============================================================================
 # Configuration
 # =============================================================================
-CLAUDE_DIR = os.path.expanduser("~/.claude")
+CLAUDE_DIR, CLAUDE_DIR_SOURCE = resolve_claude_dir()
 HOST = "127.0.0.1"
 PORT = 5141
 PORT_FALLBACK_LIMIT = 200
@@ -80,8 +116,8 @@ DEFAULT_API_CONFIG = {
 
 DEFAULT_QL_PATH = os.path.expanduser("~")
 
-APP_VERSION = "v2.0-preview.12"
-APP_UI_VERSION = "v2.0-preview.12"
+APP_VERSION = "v2.0-preview.14"
+APP_UI_VERSION = "v2.0-preview.14"
 # The index is a rebuildable cache shared by source and packaged launches.
 # Keeping it outside EXE_DIR prevents the two launch modes from drifting apart.
 INDEX_DATA_DIR = (
@@ -1376,10 +1412,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_v2_get(self, path, qs):
         try:
-            ensure_v2_index()
             subpath = path[len("/api/v2/"):]
+            if subpath == "usage":
+                try:
+                    usage = cc_switch_usage.read_claude_code_usage()
+                    usage["available"] = True
+                    self._send_json(usage)
+                except cc_switch_usage.CCSwitchUsageUnavailable:
+                    self._send_json({"available": False})
+                return
+            ensure_v2_index()
             if subpath == "dashboard":
                 data = v2_index.dashboard(INDEX_DB_FILE)
+                try:
+                    usage = cc_switch_usage.read_claude_code_usage()
+                    cc_switch_usage.apply_to_dashboard(data, usage)
+                except cc_switch_usage.CCSwitchUsageUnavailable:
+                    cc_switch_usage.mark_local_fallback(data)
                 attach_session_summaries(data.get("recent_sessions", []))
                 self._send_json(data)
                 return
@@ -2417,6 +2466,10 @@ class Handler(BaseHTTPRequestHandler):
             "ql_perm": _ai_config.get("ql_perm", "std"),
             "ql_permissions": {k: {"label": v["label"], "desc": v["desc"]} for k, v in PERMISSION_PRESETS.items()},
             "ql_default_path": DEFAULT_QL_PATH,
+            "claude_dir": CLAUDE_DIR,
+            "claude_dir_source": CLAUDE_DIR_SOURCE,
+            "projects_dir": PROJECTS_DIR,
+            "projects_dir_available": os.path.isdir(PROJECTS_DIR),
         }
         settings_path = os.path.join(CLAUDE_DIR, "settings.json")
         if os.path.isfile(settings_path):
@@ -2425,7 +2478,7 @@ class Handler(BaseHTTPRequestHandler):
                     config["settings"] = mask_sensitive_config(json.load(f))
             except Exception:
                 config["settings"] = {"error": "无法解析"}
-        claude_md = os.path.join(os.path.dirname(CLAUDE_DIR), "CLAUDE.md")
+        claude_md = os.path.join(CLAUDE_DIR, "CLAUDE.md")
         if os.path.isfile(claude_md):
             try:
                 with open(claude_md, encoding="utf-8") as f:
