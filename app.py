@@ -27,6 +27,16 @@ import cc_switch_usage
 import v2_index
 
 _VALID_ID = re.compile(r"^[a-zA-Z0-9._\-]+$")
+# Team ids are directory names under the teams/ folder and may legitimately
+# contain non-ASCII characters (e.g. Chinese team names), so the team detail
+# route validates with a blocklist instead of _VALID_ID's ASCII allowlist.
+_TEAM_ID_REJECT = re.compile(r"[\x00-\x1f\x7f/\\?#]")
+
+
+def _is_valid_team_id(team_id):
+    return bool(team_id) and ".." not in team_id and not _TEAM_ID_REJECT.search(team_id)
+
+
 MAX_POST_BODY = 64 * 1024  # 64 KB max request body
 
 
@@ -116,8 +126,8 @@ DEFAULT_API_CONFIG = {
 
 DEFAULT_QL_PATH = os.path.expanduser("~")
 
-APP_VERSION = "v2.0-preview.15"
-APP_UI_VERSION = "v2.0-preview.15"
+APP_VERSION = "v2.0-preview.16"
+APP_UI_VERSION = "v2.0-preview.16"
 # The index is a rebuildable cache shared by source and packaged launches.
 # Keeping it outside EXE_DIR prevents the two launch modes from drifting apart.
 INDEX_DATA_DIR = (
@@ -587,6 +597,26 @@ def _unique_trash_path(path):
         if not os.path.exists(candidate):
             return candidate
     raise RuntimeError("无法生成唯一回收站路径")
+
+
+def _move_agent_meta(filepath, dest):
+    """Move a member agent's metadata sidecar into the trash next to its
+    session file. Renamed to *.agent-meta.json so it never collides with the
+    trash record's own metadata (dest + ".meta.json"). The canonical sidecar
+    is <name>.meta.json (same convention as v2_index._read_agent_meta); the
+    <name>.jsonl.meta.json form is accepted as a fallback. Only sidecars that
+    sit in the same directory as the session file are touched; missing
+    sidecars are skipped."""
+    if not filepath.endswith(".jsonl"):
+        return
+    real_filepath = os.path.realpath(filepath)
+    source_dir = os.path.dirname(real_filepath)
+    meta_path = os.path.realpath(real_filepath[:-6] + ".meta.json")
+    if not os.path.isfile(meta_path) or os.path.dirname(meta_path) != source_dir:
+        meta_path = os.path.realpath(real_filepath + ".meta.json")
+    if not os.path.isfile(meta_path) or os.path.dirname(meta_path) != source_dir:
+        return
+    shutil.move(meta_path, dest + ".agent-meta.json")
 
 
 def attach_session_summaries(items):
@@ -1503,6 +1533,27 @@ class Handler(BaseHTTPRequestHandler):
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
                 ))
                 return
+            if subpath == "teams":
+                self._send_json(v2_index.list_teams(
+                    INDEX_DB_FILE,
+                    q=((qs.get("q") or [""])[0]).strip(),
+                    limit=self._q_int(qs, "limit", 80, 1, 200),
+                    offset=self._q_int(qs, "offset", 0, 0, 1000000),
+                ))
+                return
+            if subpath.startswith("team/"):
+                # The frontend encodes the team id with encodeURIComponent, so
+                # the path segment may contain percent-encoded UTF-8.
+                team_id = urllib.parse.unquote(subpath[len("team/"):])
+                if not _is_valid_team_id(team_id):
+                    self._send_json({"error": "invalid team id"}, 400)
+                    return
+                detail = v2_index.team_detail(INDEX_DB_FILE, team_id)
+                if not detail:
+                    self._send_json({"error": "team not found"}, 404)
+                    return
+                self._send_json(detail)
+                return
             if subpath.startswith("project/") and subpath.endswith("/sessions"):
                 project_id = subpath[len("project/"):-len("/sessions")]
                 if not _VALID_ID.match(project_id):
@@ -1667,6 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(dest_dir, exist_ok=True)
             dest = _unique_trash_path(os.path.join(dest_dir, session_id + "_" + _trash_stamp() + ".jsonl"))
             shutil.move(filepath, dest)
+            _move_agent_meta(filepath, dest)
             _write_trash_meta(dest, {
                 "type": "session",
                 "project_id": project_id,
@@ -1767,6 +1819,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 dest = _unique_trash_path(os.path.join(dest_dir, session_id + "_" + _trash_stamp() + ".jsonl"))
                 shutil.move(filepath, dest)
+                _move_agent_meta(filepath, dest)
                 _write_trash_meta(dest, {
                     "type": "session",
                     "project_id": record_project_id,
