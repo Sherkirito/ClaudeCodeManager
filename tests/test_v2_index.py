@@ -69,7 +69,9 @@ class LogicalProjectIndexTests(unittest.TestCase):
         sessions_a = v2_index.list_sessions(self.db, project_id=by_path[self.real_a]["id"])
         self.assertEqual(sessions_a["total"], 1)
         self.assertEqual(sessions_a["items"][0]["title"], "甲任务")
-        self.assertEqual(sessions_a["items"][0]["record_project_id"], self.record_id)
+        # §4.1: physical record ids never appear in list_sessions items
+        self.assertEqual(sessions_a["items"][0]["project_id"], by_path[self.real_a]["id"])
+        self.assertNotIn("record_project_id", sessions_a["items"][0])
 
     def test_unchanged_refresh_reuses_file_index(self):
         v2_index.scan_incremental(self.db, self.projects, read_jsonl, fix_text)
@@ -195,15 +197,18 @@ class AutomaticSessionIndexTests(unittest.TestCase):
             for entry in [row, {"type": "ai-title", "aiTitle": title}]:
                 stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    def test_list_sessions_defaults_to_primary_only(self):
+    def test_list_sessions_defaults_to_all(self):
+        # §4.1: the default facet is "all" so every session is findable (C1)
         data = v2_index.list_sessions(self.db, project_id=self.logical_id)
-        self.assertEqual(data["kind"], "primary")
-        self.assertEqual(data["total"], 1)
-        self.assertEqual(data["items"][0]["session_kind"], "primary")
+        self.assertEqual(data["kind"], "all")
+        self.assertEqual(data["total"], 4)
         self.assertEqual(data["primary_total"], 1)
         self.assertEqual(data["automatic_all_total"], 3)
-        self.assertEqual(data["automatic_total"], 2)
-        self.assertEqual(len(data["automatic_items"]), 2)
+        self.assertEqual(data["automatic_total"], 3)
+        self.assertEqual(
+            data["by_kind"],
+            {"primary": 1, "job": 1, "sdk": 1, "subagent": 1, "teammate": 0},
+        )
 
     def test_list_sessions_kind_primary_returns_only_primaries(self):
         data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="primary")
@@ -219,7 +224,8 @@ class AutomaticSessionIndexTests(unittest.TestCase):
         )
         subagent = next(row for row in data["items"] if row["session_kind"] == "subagent")
         self.assertEqual(subagent["parent_session_id"], self.primary_id)
-        self.assertEqual(subagent["parent"]["id"], self.primary_id)
+        # §4.1: the parent object is gone; rows carry parent_title instead
+        self.assertEqual(subagent["parent_title"], "主会话标题")
         # flat mode must not nest children, so nothing appears twice
         for row in data["items"]:
             self.assertNotIn("children", row)
@@ -233,14 +239,16 @@ class AutomaticSessionIndexTests(unittest.TestCase):
         )
         job = next(row for row in data["items"] if row["session_kind"] == "job")
         self.assertEqual(job["parent_session_id"], "")
-        self.assertIsNone(job["parent"])
+        self.assertEqual(job["parent_title"], "")
         subagent = next(row for row in data["items"] if row["session_kind"] == "subagent")
-        self.assertEqual(subagent["parent"]["id"], self.primary_id)
+        self.assertEqual(subagent["parent_title"], "主会话标题")
 
-    def test_unknown_kind_falls_back_to_primary(self):
+    def test_unknown_kind_falls_back_to_all(self):
+        # §4.1: unknown kind values fall back to the default view, never
+        # hiding sessions (C1)
         data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="bogus")
-        self.assertEqual(data["kind"], "primary")
-        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["kind"], "all")
+        self.assertEqual(data["total"], 4)
 
     def test_session_detail_opens_job_session_with_indexed_messages(self):
         detail = v2_index.session_detail(self.db, self.logical_id, self.job_id)
