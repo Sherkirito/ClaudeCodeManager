@@ -133,6 +133,7 @@ const state = {
   usagePollInFlight: false,
   projects: { q: "", drive: "", sort: "active", offset: 0, limit: 50, dirParts: [], data: null, dirs: null },
   sessions: { q: "", offset: 0, limit: 60, kind: "all" },
+  teams: { q: "", offset: 0, limit: 60 },
   selectedProjects: new Set(),
   selectedSessions: new Map(),
   projectViews: new Map(),
@@ -295,6 +296,54 @@ function rowMeta(items) {
   }));
 }
 
+const MEMBER_COLORS = {
+  blue: "#6ea8fe", green: "#5fcf9a", yellow: "#e7b55e", purple: "#b48ce9",
+  orange: "#f0a05c", pink: "#f28fb1", red: "#f07178", cyan: "#5cd6d0"
+};
+
+function memberDot(color) {
+  const hex = MEMBER_COLORS[String(color || "").toLowerCase()] || "#919baa";
+  return h("span", { className: "member-dot", style: `background:${hex}` });
+}
+
+function parseTeammateEnvelopes(value) {
+  // 顺序解析连续信封：正文用 indexOf 截到第一个 </teammate-message>，
+  // 不存在跨信封回溯；属性顺序无关（teammate_id / teammateId / summary）。
+  // 整段文本必须是由信封（可夹空白）构成，否则返回 null 回退原文展示。
+  const text = String(value || "");
+  const envelopes = [];
+  let cursor = 0;
+  while (true) {
+    cursor += text.slice(cursor).match(/^\s*/)[0].length;
+    if (cursor >= text.length) break;
+    const openMatch = text.slice(cursor).match(/^<teammate-message(?:\s[^>]*)?>/);
+    if (!openMatch) return null;
+    const openTag = openMatch[0];
+    const closeAt = text.indexOf("</teammate-message>", cursor + openTag.length);
+    if (closeAt === -1) return null;
+    const teammateId = /teammate_id="([^"]*)"/.exec(openTag)?.[1]
+      || /teammateId="([^"]*)"/.exec(openTag)?.[1] || "";
+    const summary = /summary="([^"]*)"/.exec(openTag)?.[1] || "";
+    envelopes.push({
+      teammateId: teammateId || "unknown",
+      summary,
+      body: text.slice(cursor + openTag.length, closeAt).trim()
+    });
+    cursor = closeAt + "</teammate-message>".length;
+  }
+  return envelopes.length ? envelopes : null;
+}
+
+function stripTeammateEnvelope(value) {
+  const text = String(value || "");
+  const envelopes = parseTeammateEnvelopes(text);
+  if (!envelopes) return text;
+  const envelope = envelopes[0];
+  const firstLine = envelope.body.split("\n", 1)[0].trim();
+  const body = truncateText(firstLine, 80);
+  return `来自 ${envelope.teammateId}：${envelope.summary ? `${envelope.summary} — ` : ""}${body}`;
+}
+
 function registerLaunchContext(context) {
   const key = `launch-${++state.launchCounter}`;
   state.launchContexts.set(key, context);
@@ -324,11 +373,14 @@ function sessionEntry(session, { selectable = false, compact = false, hideChildr
     })));
   }
   const titleLine = h("div", { className: "row-title-line" }, h("span", { className: "row-title", text: session.title || sessionId }));
+  const isTeammate = session.task_kind === "in_process_teammate";
   if (!isPrimary) {
     titleLine.append(tag(sessionKindLabel(session.session_kind), session.relation_confidence === "exact" ? "success" : "info"));
+    if (isTeammate) titleLine.append(tag(`队友 · ${session.agent_type || session.agent_name || "unknown"}`, "info"));
+    if (session.team_name) titleLine.append(tag(`团队 · ${session.team_name}`, "success"));
     if (session.parent) titleLine.append(tag(`父会话 · ${truncateText(session.parent.title || session.parent.id, 20)}`, "success"));
     else if (session.parent_session_id) titleLine.append(tag("父会话缺失", "warning"));
-    else if (!compact) titleLine.append(tag("未关联父会话", "warning"));
+    else if (!compact) titleLine.append(tag(isTeammate ? "lead 会话未收录" : "未关联父会话", "warning"));
   }
   if (session.child_count) titleLine.append(tag(`下属 ${session.child_count}`, "info"));
   if (session.cwd_changed) titleLine.append(tag("CWD 变化", "warning"));
@@ -336,7 +388,7 @@ function sessionEntry(session, { selectable = false, compact = false, hideChildr
   if (session.path_exists === 0) titleLine.append(tag("目录疑似已移动", "warning"));
   const open = h("button", { className: "row-click", type: "button", dataset: { action: "open-session", projectId, sessionId } },
     titleLine,
-    h("p", { className: "row-description", text: session.first_user_msg || session.cwd || "暂无首条消息" }),
+    h("p", { className: "row-description", text: stripTeammateEnvelope(session.first_user_msg) || session.cwd || "暂无首条消息" }),
     rowMeta([
       { icon: "folder", text: session.project_name || shortPath(session.cwd) },
       { icon: "clock", text: session.last_active || session.created_at || "时间未知" }
@@ -395,7 +447,7 @@ function projectRow(project, description = null) {
 }
 
 function updateActiveNav() {
-  const mainRoute = ["project", "session"].includes(state.route) ? "projects" : state.route;
+  const mainRoute = ["project", "session", "team"].includes(state.route) ? "projects" : state.route;
   document.querySelectorAll("[data-route]").forEach((node) => node.classList.toggle("is-active", node.dataset.route === mainRoute));
 }
 
@@ -413,6 +465,7 @@ function routeHash(route, params) {
   if (route === "project") return `#/project/${encode(params.projectId)}`;
   if (route === "session") return `#/session/${encode(params.projectId)}/${encode(params.sessionId)}`;
   if (route === "search") return `#/search?q=${encode(params.q || "")}`;
+  if (route === "team") return `#/team/${encode(params.teamId)}`;
   return `#/${route}`;
 }
 
@@ -435,6 +488,8 @@ async function renderCurrentPage() {
     if (state.route === "dashboard") await renderDashboard(token);
     else if (state.route === "projects") await renderProjects(token);
     else if (state.route === "sessions") await renderSessions(token);
+    else if (state.route === "teams") await renderTeams(token);
+    else if (state.route === "team") await renderTeam(token, state.params.teamId);
     else if (state.route === "project") await renderProject(token, state.params.projectId);
     else if (state.route === "session") await renderSession(token, state.params.projectId, state.params.sessionId);
     else if (state.route === "search") await renderSearch(token, state.params.q || "");
@@ -474,7 +529,7 @@ async function renderDashboard(token) {
     pageHeading("Overview", "工作台", "查看本地 Claude Code 记录与近 30 天 API 用量。", [button("刷新索引", "reindex", { kind: "secondary", iconName: "refresh" })]),
     h("div", { className: "stats-grid" },
       statCard("项目", formatExactNumber(stats.total_projects), "已建立本地索引", "folder"),
-      statCard("主会话", formatExactNumber(stats.total_sessions), `自动/下属另计 ${formatExactNumber(stats.total_automatic_sessions)} 个`, "message"),
+      statCard("主会话", formatExactNumber(stats.total_sessions), `自动/下属另计 ${formatExactNumber(stats.total_automatic_sessions)} 个${stats.total_teams !== undefined && stats.total_teams !== null ? ` · 团队 ${formatExactNumber(stats.total_teams)} 个` : ""}`, "message"),
       statCard("主会话记录", formatExactNumber(primaryMessages), `本地 user/assistant 记录；自动任务另计 ${formatExactNumber(automaticMessages)} 条`, "database"),
       usageCard
     ),
@@ -627,7 +682,7 @@ async function renderSessions(token) {
   ]);
   if (token !== state.renderToken) return;
   const kindSelect = h("select", { id: "session-kind", dataset: { change: "session-filter" } },
-    ...[["all", "全部会话"], ["primary", "主会话"], ["automatic", "自动会话"]].map(([value, label]) => h("option", { value, text: label, selected: view.kind === value }))
+    ...[["all", "全部会话"], ["primary", "主会话"], ["automatic", "自动会话"], ["teammate", "队友会话"]].map(([value, label]) => h("option", { value, text: label, selected: view.kind === value }))
   );
   const toolbar = h("div", { className: "toolbar" },
     h("label", { className: "field field-grow" }, h("span", { text: "会话关键词" }), h("input", { id: "session-query", value: view.q, placeholder: "搜索标题、首条消息或目录…", dataset: { enter: "session-filter" } })),
@@ -640,8 +695,9 @@ async function renderSessions(token) {
     all: ["全部会话", `${formatNumber(data.total)} 个会话 · 主会话 ${formatNumber(data.primary_total)} · 自动会话 ${formatNumber(data.automatic_all_total)}`],
     primary: ["主会话列表", `${formatNumber(data.total)} 个主会话`],
     automatic: ["自动会话", `${formatNumber(data.total)} 个自动会话（Job / SDK / Subagent）`],
+    teammate: ["队友会话", `${formatNumber(data.total)} 个队友会话（in-process teammate）`],
   }[view.kind] || ["主会话列表", `${formatNumber(data.total)} 个主会话`];
-  const emptyText = { all: "没有匹配会话", primary: "没有匹配主会话", automatic: "没有匹配的自动会话" }[view.kind] || "没有匹配会话";
+  const emptyText = { all: "没有匹配会话", primary: "没有匹配主会话", automatic: "没有匹配的自动会话", teammate: "没有匹配的队友会话" }[view.kind] || "没有匹配会话";
   if (!(data.items || []).length) list.append(emptyState(emptyText, "换一个关键词，或重建索引后再试。", "message"));
   const orphanList = h("div", { className: "list" });
   (orphanData.items || []).forEach((session) => orphanList.append(h("div", { className: "list-row" },
@@ -657,6 +713,52 @@ async function renderSessions(token) {
     toolbar,
     panel(panelMeta[0], panelMeta[1], h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "sessions"))),
     panel("待恢复历史会话", `${formatNumber(orphanData.total || 0)} 个候选；仅提示，不会自动重建或重定向`, orphanList)
+  );
+}
+
+async function renderTeams(token) {
+  setBreadcrumbs([{ label: "团队列表" }]);
+  const view = state.teams;
+  const data = await api(`/api/v2/teams?q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`);
+  if (token !== state.renderToken) return;
+  const toolbar = h("div", { className: "toolbar" },
+    h("label", { className: "field field-grow" }, h("span", { text: "团队关键词" }), h("input", { id: "team-query", value: view.q, placeholder: "搜索团队名称、Lead 或目录…", dataset: { enter: "team-filter" } })),
+    button("搜索", "team-filter", { kind: "primary", iconName: "search" })
+  );
+  const list = h("div", { className: "list" });
+  (data.items || []).forEach((team) => list.append(teamRow(team)));
+  if (!(data.items || []).length) list.append(emptyState("没有团队", "检测到使用 Claude Code Agent team 后会自动收录。", "user"));
+  pageRoot.replaceChildren(
+    pageHeading("Teams", "团队", "按 Agent team 汇总的队友与协作统计。"),
+    toolbar,
+    panel("团队列表", `${formatNumber(data.total || 0)} 个团队`, h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "teams")))
+  );
+}
+
+function teamRow(team) {
+  const teamId = team.id;
+  const titleLine = h("div", { className: "row-title-line" },
+    h("span", { className: "row-title", text: team.name || teamId }),
+    tag(`成员 ${formatNumber(team.member_count)}`, "info")
+  );
+  if (team.config_error) titleLine.append(tag("配置损坏", "warning"));
+  return h("div", {
+    className: "list-row is-clickable",
+    dataset: { action: "open-team", teamId },
+    title: "打开团队详情"
+  },
+    h("button", { className: "row-click", type: "button", dataset: { action: "open-team", teamId } },
+      titleLine,
+      h("p", { className: "row-description", text: team.lead_agent_id ? `Lead Agent ${team.lead_agent_id}` : "暂无 lead 记录" }),
+      h("p", { className: "row-description path", text: team.cwd || "目录未知" }),
+      rowMeta([{ icon: "clock", text: team.last_active || team.created_at || "时间未知" }])
+    ),
+    h("div", { className: "row-side" },
+      h("div", { className: "metric" }, h("strong", { text: formatNumber(team.session_count) }), h("span", { text: "会话" })),
+      h("div", { className: "metric" }, h("strong", { text: formatNumber(team.total_msgs) }), h("span", { text: "消息" })),
+      h("div", { className: "metric" }, h("strong", { text: formatNumber(team.total_tokens) }), h("span", { text: "tokens" })),
+      h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight"))
+    )
   );
 }
 
@@ -837,9 +939,16 @@ async function renderSession(token, projectId, sessionId) {
     pager(data.total || 0, data.offset || 0, data.limit || view.limit, "messages", projectId)
   );
   reader.dataset.sessionId = sessionId;
+  const isTeammate = session.task_kind === "in_process_teammate";
   const lineage = !isPrimary ? h("div", { className: "lineage-callout" },
-    icon("activity"),
-    h("div", {}, h("strong", { text: sessionKindLabel(session.session_kind) }), h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : "未关联父会话：该自动会话没有足够的证据确定母会话。" })),
+    icon(isTeammate ? "user" : "activity"),
+    h("div", {},
+      h("strong", {}, isTeammate
+        ? h("span", { className: "teammate-dot-line" }, memberDot(session.agent_color), document.createTextNode(`队友 · ${session.agent_name || session.agent_id || "unknown"}`))
+        : sessionKindLabel(session.session_kind)),
+      h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : (isTeammate ? "lead 会话未收录：该队友会话没有关联到 lead 主会话。" : "未关联父会话：该自动会话没有足够的证据确定母会话。") }),
+      isTeammate && session.team_name ? h("p", { text: `所属团队：${session.team_name}` }) : null
+    ),
     session.parent ? button("查看母会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: session.parent.project_id, sessionId: session.parent.id } }) : null
   ) : h("div", { hidden: true });
   const childRows = session.children || [];
@@ -852,9 +961,13 @@ async function renderSession(token, projectId, sessionId) {
   const actions = [button("打开所在文件夹", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openSessionDirectory } })];
   if (isPrimary) actions.push(button("生成总结", "summarize-session", { kind: "secondary", iconName: "spark", dataset: { projectId: recordProjectId, sessionId } }), button("恢复会话", "open-launch", { kind: "primary", iconName: "play", dataset: { launchKey } }), button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId: recordProjectId, logicalProjectId: projectId, sessionId } }));
   else actions.push(button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId, sessionId } }));
+  const teammateInfo = isTeammate && session.agent_description
+    ? h("div", { className: "info-card teammate-info" }, h("h3", { text: "队友任务" }), h("p", { text: session.agent_description }))
+    : null;
   pageRoot.replaceChildren(
     pageHeading("Session", session.title || sessionId, isPrimary ? "按角色进行服务端分页，工具调用默认折叠。" : "自动会话不提供恢复；可查看消息与 Token 统计，并可移入回收站。", actions),
     lineage,
+    teammateInfo,
     childrenPanel,
     h("div", { className: "session-overview" },
       summaryMetric("会话类型", sessionKindLabel(session.session_kind)),
@@ -875,6 +988,66 @@ async function renderSession(token, projectId, sessionId) {
   );
 }
 
+async function renderTeam(token, teamId) {
+  const data = await api(`/api/v2/team/${encode(teamId)}`);
+  if (token !== state.renderToken) return;
+  const team = data.team || {};
+  const lead = data.lead || null;
+  const members = data.members || [];
+  setBreadcrumbs([{ label: "团队列表", route: "teams" }, { label: team.name || teamId }]);
+  const leadCallout = lead ? h("div", { className: "lineage-callout" },
+    icon("user"),
+    h("div", {},
+      h("strong", { text: `Lead Agent ${lead.agent_id || "unknown"}` }),
+      h("p", { text: lead.session ? `lead 会话：${lead.session.title || lead.session.id}` : "lead 会话未收录：暂无该 lead 对应的主会话日志。" })
+    ),
+    lead.session ? button("查看 lead 会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: lead.session.project_id, sessionId: lead.session.id } }) : null
+  ) : null;
+  const memberList = h("div", { className: "list" });
+  members.forEach((member) => memberList.append(memberRow(member)));
+  if (!members.length) memberList.append(emptyState("暂无团队成员", "该团队尚未收录任何队友会话。", "user"));
+  pageRoot.replaceChildren(
+    pageHeading("Team", team.name || teamId, team.cwd || ""),
+    h("div", { className: "project-summary-strip" },
+      summaryMetric("成员", formatNumber(team.member_count ?? members.length)),
+      summaryMetric("会话", formatNumber(team.session_count)),
+      summaryMetric("消息", formatNumber(team.total_msgs)),
+      summaryMetric("Token", formatNumber(team.total_tokens))
+    ),
+    team.config_error ? h("div", { className: "inline-alert alert-warning" }, icon("alert"), h("div", {}, h("strong", { text: "团队配置损坏" }), h("p", { text: String(team.config_error) }))) : null,
+    leadCallout,
+    panel("成员", `${members.length} 个`, memberList)
+  );
+}
+
+function memberRow(member) {
+  const session = member.session || null;
+  const confidence = member.confidence || "";
+  const confidenceTag = (confidence === "exact" || confidence === "lead_dir")
+    ? tag("精确关联", "success")
+    : confidence === "meta_scope" ? tag("前缀匹配", "info") : tag("仅团队级", "warning");
+  const titleLine = h("div", { className: "row-title-line" },
+    memberDot(member.color),
+    h("span", { className: "row-title", text: member.name || member.agent_id || "未命名成员" }),
+    tag(member.agent_type || member.name || "teammate", "info"),
+    confidenceTag
+  );
+  const sessionProjectId = session ? (member.logical_project_id || session.project_id) : "";
+  const description = session
+    ? `${session.title || session.id} · ${formatNumber(session.total_msgs)} 条消息 · 最近活跃 ${session.last_active || session.created_at || "未知"}`
+    : "该成员尚无日志记录";
+  const main = session
+    ? h("button", { className: "row-click", type: "button", dataset: { action: "open-session", projectId: sessionProjectId, sessionId: session.id } }, titleLine, h("p", { className: "row-description", text: description }), rowMeta([{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }]))
+    : h("div", {}, titleLine, h("p", { className: "row-description", text: description }), rowMeta([{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }]));
+  const row = h("div", {
+    className: `list-row${session ? " is-clickable" : ""}`,
+    dataset: session ? { action: "open-session", projectId: sessionProjectId, sessionId: session.id } : undefined,
+    title: session ? "打开会话详情" : undefined
+  }, main);
+  if (session) row.append(h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight")));
+  return row;
+}
+
 function summaryMetric(label, value) { return h("div", { className: "summary-metric" }, h("span", { text: label }), h("strong", { text: value })); }
 
 function appendConversationMessages(container, messages) {
@@ -891,6 +1064,10 @@ function appendConversationMessages(container, messages) {
         return;
       }
       flushActions();
+      if (segment.type === "teammate") {
+        container.append(teammateMessageBlock(message, segment));
+        return;
+      }
       if (segment.text.trim()) container.append(messageBlock(message, segment.text));
     });
   });
@@ -901,7 +1078,12 @@ function messageSegments(message) {
   const fallback = String(message.text || "");
   let content = null;
   try { content = JSON.parse(message.content_json || "null"); } catch { /* use indexed text */ }
-  if (typeof content === "string") return content ? [machineContextSegment(content, message) || { type: "text", text: content }] : [];
+  if (typeof content === "string") {
+    if (!content) return [];
+    const envelopes = parseTeammateEnvelopes(content);
+    if (envelopes) return envelopes.map((envelope) => ({ type: "teammate", ...envelope }));
+    return [machineContextSegment(content, message) || { type: "text", text: content }];
+  }
   if (!Array.isArray(content)) return fallback ? legacyMessageSegments(message, fallback) : [];
 
   const segments = [];
@@ -1102,12 +1284,9 @@ function formatToolResult(content) {
   }).filter(Boolean).join("\n");
 }
 
-function messageBlock(message, rawOverride = null) {
-  const original = rawOverride === null ? String(message.text || "") : String(rawOverride || "");
-  const truncated = original.length > 16000;
-  const raw = truncated ? original.slice(0, 16000) : original;
+function messageArticle(message) {
   const role = message.role === "user" ? "user" : "assistant";
-  const article = h("article", { className: `message is-${role}` },
+  return h("article", { className: `message is-${role}` },
     h("header", { className: "message-head" },
       h("span", { className: "message-role", text: role === "user" ? "用户" : "助手" }),
       h("span", { text: `#${message.idx ?? "—"}` }),
@@ -1115,10 +1294,29 @@ function messageBlock(message, rawOverride = null) {
       h("span", { text: `${formatNumber(message.total_tokens)} tokens` })
     )
   );
+}
+
+function messageBlock(message, rawOverride = null) {
+  const original = rawOverride === null ? String(message.text || "") : String(rawOverride || "");
+  const truncated = original.length > 16000;
+  const raw = truncated ? original.slice(0, 16000) : original;
+  const article = messageArticle(message);
   const body = h("div", { className: "message-body" });
   appendMessageContent(body, raw);
   article.append(body);
   if (truncated) article.append(h("div", { className: "truncation-note" }, icon("alert"), h("span", { text: "消息超过 16,000 字符，已在前端安全截断。" })));
+  return article;
+}
+
+function teammateMessageBlock(message, segment) {
+  const article = messageArticle(message);
+  const details = h("details", { className: "agent-action-group teammate-block" },
+    h("summary", {}, icon("user"), h("span", { text: `来自队友 ${segment.teammateId}${segment.summary ? ` · ${segment.summary}` : ""}` }), h("small", { text: "默认折叠" }))
+  );
+  const body = h("div", { className: "message-body" });
+  appendMessageContent(body, segment.body || "");
+  details.append(body);
+  article.append(details);
   return article;
 }
 
@@ -1415,6 +1613,8 @@ async function executeAction(action, target) {
     return renderCurrentPage();
   }
   if (action === "session-filter") { state.sessions.q = $("#session-query")?.value.trim() || ""; state.sessions.kind = $("#session-kind")?.value || "all"; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "team-filter") { state.teams.q = $("#team-query")?.value.trim() || ""; state.teams.offset = 0; return renderCurrentPage(); }
+  if (action === "open-team") return navigate("team", { teamId: data.teamId });
   if (action === "project-dir-enter") { state.projects.dirParts.push(data.name); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-depth") { state.projects.dirParts = state.projects.dirParts.slice(0, Number(data.depth)); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-clear") { state.projects.dirParts = []; state.projects.offset = 0; return renderCurrentPage(); }
@@ -1487,6 +1687,7 @@ async function executeAction(action, target) {
 function changePage(scope, direction, projectId, sessionId) {
   if (scope === "projects") state.projects.offset = Math.max(0, state.projects.offset + direction * state.projects.limit);
   else if (scope === "sessions") state.sessions.offset = Math.max(0, state.sessions.offset + direction * state.sessions.limit);
+  else if (scope === "teams") state.teams.offset = Math.max(0, state.teams.offset + direction * state.teams.limit);
   else if (scope === "project-sessions") {
     const view = state.projectViews.get(projectId); view.offset = Math.max(0, view.offset + direction * view.limit); state.projectData.delete(projectId);
   } else if (scope === "messages") {

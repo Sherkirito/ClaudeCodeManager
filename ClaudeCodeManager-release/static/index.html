@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Claude Code 管理器</title>
   <link rel="icon" type="image/png" href="/static/app-icon.png?v=20260716-icon-v3">
-  <link rel="stylesheet" href="/static/style.css?v=20260811-readable-agent-actions">
+  <link rel="stylesheet" href="/static/style.css?v=20260813-agent-teams">
 </head>
 <body>
   <div class="app-shell" id="app-shell">
@@ -29,6 +29,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3z"/><path d="M8 9h8M8 12h5"/></svg>
           <span>跨项目会话</span>
         </button>
+        <button class="nav-item" type="button" data-route="teams">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.25"/><path d="M3.8 19.2a5.25 5.25 0 0 1 10.4 0"/><circle cx="16.6" cy="9.4" r="2.55"/><path d="M15.2 13.9a4.3 4.3 0 0 1 4.8 4.3"/></svg>
+          <span>团队</span>
+        </button>
         <button class="nav-item" type="button" data-route="settings">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
           <span>系统设置</span>
@@ -39,7 +43,7 @@
         <p class="status-heading">本地环境</p>
         <div class="status-row"><span class="status-dot is-pending" id="claude-status-dot"></span><span>Claude CLI</span><strong id="claude-status-text">检测中</strong></div>
         <div class="status-row"><span class="status-dot is-pending" id="ai-status-dot"></span><span>AI 服务</span><strong id="ai-status-text">检测中</strong></div>
-        <p class="version">v2.0 preview.14</p>
+        <p class="version">v2.0 preview.16</p>
       </div>
     </aside>
 
@@ -115,6 +119,6 @@
   <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <noscript><div class="noscript"><h1>需要启用 JavaScript</h1><p>Claude Code 管理器需要 JavaScript 才能运行。</p></div></noscript>
-  <script type="module" src="/static/app.js?v=20260811-context-fold-v2"></script>
+  <script type="module" src="/static/app.js?v=20260813-agent-teams"></script>
 </body>
 </html>

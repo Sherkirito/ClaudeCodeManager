@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 HISTORY_INDEX_VERSION = 1
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_READY = {}
@@ -97,6 +97,13 @@ def init_db(conn):
             logical_project_id TEXT NOT NULL DEFAULT '',
             path_exists INTEGER NOT NULL DEFAULT 1,
             grouping_reason TEXT NOT NULL DEFAULT 'record_dir',
+            agent_type TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            agent_description TEXT NOT NULL DEFAULT '',
+            agent_color TEXT NOT NULL DEFAULT '',
+            task_kind TEXT NOT NULL DEFAULT '',
+            team_id TEXT NOT NULL DEFAULT '',
+            team_confidence TEXT NOT NULL DEFAULT '',
             indexed_at REAL NOT NULL,
             PRIMARY KEY (project_id, id)
         );
@@ -142,6 +149,35 @@ def init_db(conn):
             detected_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS teams (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            lead_agent_id TEXT NOT NULL DEFAULT '',
+            lead_session_id TEXT NOT NULL DEFAULT '',
+            cwd TEXT NOT NULL DEFAULT '',
+            member_count INTEGER NOT NULL DEFAULT 0,
+            session_count INTEGER NOT NULL DEFAULT 0,
+            total_msgs INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            last_active TEXT NOT NULL DEFAULT '',
+            config_error INTEGER NOT NULL DEFAULT 0,
+            indexed_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS team_members (
+            team_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT '',
+            joined_at TEXT NOT NULL DEFAULT '',
+            agent_type TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            session_project_id TEXT NOT NULL DEFAULT '',
+            match_confidence TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (team_id, agent_id)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             project_id UNINDEXED,
             session_id UNINDEXED,
@@ -178,6 +214,13 @@ def init_db(conn):
             "logical_project_id": "TEXT NOT NULL DEFAULT ''",
             "path_exists": "INTEGER NOT NULL DEFAULT 1",
             "grouping_reason": "TEXT NOT NULL DEFAULT 'record_dir'",
+            "agent_type": "TEXT NOT NULL DEFAULT ''",
+            "agent_name": "TEXT NOT NULL DEFAULT ''",
+            "agent_description": "TEXT NOT NULL DEFAULT ''",
+            "agent_color": "TEXT NOT NULL DEFAULT ''",
+            "task_kind": "TEXT NOT NULL DEFAULT ''",
+            "team_id": "TEXT NOT NULL DEFAULT ''",
+            "team_confidence": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in migrations.items():
             if name not in columns:
@@ -795,6 +838,380 @@ def _infer_job_parents(direct_sessions):
     return parents
 
 
+def _read_agent_meta(jsonl_path):
+    """Read a subagent log's sibling .meta.json and return teammate fields.
+
+    Returns {} unless the meta marks the agent as an in-process teammate
+    (taskKind == 'in_process_teammate') carrying a team name, in which case
+    the member fields are returned keyed by sessions column names. A missing
+    or unparsable meta file also yields {}.
+    """
+    meta_path = (
+        jsonl_path[:-6] + ".meta.json" if jsonl_path.endswith(".jsonl") else jsonl_path + ".meta.json"
+    )
+    try:
+        with open(meta_path, "r", encoding="utf-8", errors="replace") as stream:
+            meta = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    if meta.get("taskKind") != "in_process_teammate" or not meta.get("teamName"):
+        return {}
+    return {
+        "agent_type": str(meta.get("agentType") or ""),
+        "agent_name": str(meta.get("name") or ""),
+        "agent_description": str(meta.get("description") or ""),
+        "agent_color": str(meta.get("color") or ""),
+        "task_kind": "in_process_teammate",
+        "team_id": str(meta.get("teamName") or ""),
+    }
+
+
+_AGENT_META_COLUMNS = (
+    "agent_type", "agent_name", "agent_description",
+    "agent_color", "task_kind", "team_id",
+)
+
+
+def _update_session_agent_meta(conn, project_id, session_id, agent_meta):
+    """Refresh teammate columns for a gated file without re-reading its log."""
+    stored = conn.execute(
+        "SELECT agent_type, agent_name, agent_description, agent_color, task_kind, team_id "
+        "FROM sessions WHERE project_id = ? AND id = ?",
+        (project_id, session_id),
+    ).fetchone()
+    if stored is None:
+        return
+    changes = [
+        column for column in _AGENT_META_COLUMNS
+        if (stored[column] or "") != str(agent_meta.get(column) or "")
+    ]
+    if not changes:
+        return
+    assignments = ", ".join(column + " = ?" for column in changes)
+    conn.execute(
+        f"UPDATE sessions SET {assignments} WHERE project_id = ? AND id = ?",
+        [str(agent_meta.get(column) or "") for column in changes] + [project_id, session_id],
+    )
+
+
+_TEAM_CONF_RANK = {
+    "lead_session": 0,
+    "exact": 1,
+    "meta_scope": 2,
+    "lead_dir": 3,
+    "team_name": 4,
+}
+
+
+def _iso_created_at(value):
+    if value in (None, ""):
+        return ""
+    try:
+        timestamp = float(value)
+        if timestamp > 100000000000:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(value)
+
+
+def _agent_id_matches_member(agent_id, member_name):
+    """True when a session agent id carries the member name as a token.
+
+    Matches the forms name / name-<hex> / a+name / a+name-<hex> as prefixes,
+    so "aindexer-a1b2..." resolves to the member named "indexer" without
+    matching a sibling like "indexer2".
+    """
+    if not agent_id or not member_name:
+        return False
+    lowered = agent_id.lower()
+    for prefix in (member_name.lower(), "a" + member_name.lower()):
+        if lowered == prefix or lowered.startswith(prefix + "-"):
+            return True
+    return False
+
+
+def _upsert_team(conn, team_id, config, now):
+    """Insert or refresh one teams row (and its member rows) from a config dict.
+
+    A falsy config marks the row as unreadable (config_error = 1) without
+    deleting existing data; a parsed config replaces the team members.
+    """
+    if config:
+        lead_agent_id = str(config.get("leadAgentId") or "")
+        lead_session_id = str(config.get("leadSessionId") or "")
+        # Privacy: config member cwd is display-only and never persisted, so
+        # teams.cwd stays empty here; team_detail derives a display value from
+        # the already-indexed lead session instead.
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO teams(
+                id, name, created_at, lead_agent_id, lead_session_id, cwd,
+                config_error, indexed_at
+            ) VALUES(?, ?, ?, ?, ?, '', 0, ?)
+            """,
+            (
+                team_id,
+                str(config.get("name") or ""),
+                _iso_created_at(config.get("createdAt")),
+                lead_agent_id,
+                lead_session_id,
+                now,
+            ),
+        )
+        conn.execute("DELETE FROM team_members WHERE team_id = ?", (team_id,))
+        for member in config.get("members") or []:
+            if not isinstance(member, dict) or not member.get("agentId"):
+                continue
+            conn.execute(
+                """
+                INSERT INTO team_members(team_id, agent_id, name, color, joined_at, agent_type)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    team_id,
+                    str(member.get("agentId") or ""),
+                    str(member.get("name") or ""),
+                    str(member.get("color") or ""),
+                    str(member.get("joinedAt") or ""),
+                    str(member.get("agentType") or ""),
+                ),
+            )
+        return
+    existing = conn.execute("SELECT 1 FROM teams WHERE id = ?", (team_id,)).fetchone()
+    if existing:
+        conn.execute("UPDATE teams SET config_error = 1 WHERE id = ?", (team_id,))
+    else:
+        conn.execute(
+            "INSERT INTO teams(id, config_error, indexed_at) VALUES(?, 1, ?)",
+            (team_id, now),
+        )
+
+
+def _refresh_teams(conn, teams_dir):
+    """Reconcile Agent team configs with sessions and member mappings.
+
+    Reads each <team>/config.json (skipping unchanged files via a stored
+    mtime:size signature), upserts teams/team_members rows, cascades four
+    evidence levels to link member sessions to members, and recomputes
+    aggregate stats every scan.
+    """
+    now = time.time()
+    session_rows = [dict(row) for row in conn.execute(
+        "SELECT project_id, id, parent_session_id, agent_id, task_kind, team_id, last_active "
+        "FROM sessions ORDER BY last_active DESC"
+    )]
+    if not os.path.isdir(teams_dir):
+        conn.execute("DELETE FROM teams")
+        conn.execute("DELETE FROM team_members")
+        conn.execute("UPDATE sessions SET team_id = '', task_kind = '', team_confidence = ''")
+        return
+
+    seen_team_ids = set()
+    for name in sorted(os.listdir(teams_dir)):
+        team_dir = os.path.join(teams_dir, name)
+        if not os.path.isdir(team_dir):
+            continue
+        seen_team_ids.add(name)
+        config_path = os.path.join(team_dir, "config.json")
+        try:
+            stat = os.stat(config_path)
+        except OSError:
+            _upsert_team(conn, name, {}, now)
+            continue
+        signature = f"{stat.st_mtime}:{stat.st_size}"
+        sig_key = "teams_scan:" + os.path.normpath(config_path)
+        old_signature = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (sig_key,)
+        ).fetchone()
+        if old_signature and old_signature["value"] == signature:
+            continue
+        config = None
+        try:
+            with open(config_path, "r", encoding="utf-8", errors="replace") as stream:
+                config = json.load(stream)
+            if not isinstance(config, dict):
+                config = None
+        except (OSError, ValueError, TypeError):
+            config = None
+        if config is None:
+            _upsert_team(conn, name, {}, now)
+            continue
+        _upsert_team(conn, name, config, now)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (sig_key, signature),
+        )
+
+    # Member<->session links are rebuilt every scan so deleted logs drop out.
+    conn.execute(
+        "UPDATE team_members SET session_id = '', session_project_id = '', match_confidence = ''"
+    )
+    team_rows = [dict(row) for row in conn.execute(
+        "SELECT id, name, lead_session_id, lead_agent_id FROM teams"
+    )]
+    member_rows = [dict(row) for row in conn.execute(
+        "SELECT team_id, agent_id, name FROM team_members"
+    )]
+    members_by_team = {}
+    for row in member_rows:
+        members_by_team.setdefault(row["team_id"], []).append(row)
+    sessions_by_id = {}
+    for row in session_rows:
+        sessions_by_id.setdefault(row["id"], []).append(row)
+
+    session_assign = {}
+    member_candidates = []
+    member_claims = {}
+
+    def offer(key, team_id, confidence):
+        rank = _TEAM_CONF_RANK[confidence]
+        current = session_assign.get(key)
+        if current is None or rank < _TEAM_CONF_RANK[current[1]]:
+            session_assign[key] = (team_id, confidence)
+
+    for team in team_rows:
+        team_id = team["id"]
+        team_name = team["name"] or ""
+        lead_session_id = team["lead_session_id"] or ""
+        lead_agent_id = team["lead_agent_id"] or ""
+        if lead_session_id:
+            # Lead link: the lead transcript may live in any record.
+            for row in sessions_by_id.get(lead_session_id, []):
+                offer((row["project_id"], row["id"]), team_id, "lead_session")
+        for member in members_by_team.get(team_id, []):
+            member_agent_id = member["agent_id"]
+            member_name = member["name"]
+            if member_agent_id == lead_agent_id or "team-lead" in member_agent_id:
+                # The lead member row never joins the generic member cascade: a
+                # stale lead transcript carrying the same leadAgentId must not
+                # be tagged as a teammate. Link the row straight to the current
+                # lead session instead (tagged by the lead link above).
+                lead_rows = sessions_by_id.get(lead_session_id, []) if lead_session_id else []
+                if lead_rows:
+                    member_claims[(team_id, member_agent_id)] = (lead_rows[0], "exact")
+                continue
+            for row in session_rows:
+                agent_id = row["agent_id"] or ""
+                if not agent_id:
+                    continue
+                in_scope = (
+                    not row["team_id"]
+                    or row["team_id"] == team_id
+                    or (team_name and row["team_id"] == team_name)
+                )
+                if not in_scope:
+                    continue
+                if agent_id == member_agent_id:
+                    member_candidates.append((1, team_id, member_agent_id, row))
+                    continue
+                if not _agent_id_matches_member(agent_id, member_name):
+                    continue
+                if row["team_id"]:
+                    # teamName scope + member name prefix match.
+                    member_candidates.append((2, team_id, member_agent_id, row))
+                elif lead_session_id and row["parent_session_id"] == lead_session_id:
+                    # Physical nesting under the lead session dir backs a member
+                    # match even without teammate meta; unrelated subagents that
+                    # match no member are never tagged this way.
+                    member_candidates.append((3, team_id, member_agent_id, row))
+
+    member_candidates.sort(key=lambda item: (item[0], item[3]["project_id"], item[3]["id"]))
+    claimed_sessions = set()
+    claimed_members = set()
+    for rank, team_id, member_agent_id, row in member_candidates:
+        key = (row["project_id"], row["id"])
+        if key in claimed_sessions or (team_id, member_agent_id) in claimed_members:
+            continue
+        claimed_sessions.add(key)
+        claimed_members.add((team_id, member_agent_id))
+        confidence = {1: "exact", 2: "meta_scope", 3: "lead_dir"}[rank]
+        member_claims[(team_id, member_agent_id)] = (row, confidence)
+        offer(key, team_id, confidence)
+
+    # Fallback: a meta teamName that resolves to exactly one team.
+    name_to_teams = {}
+    for team in team_rows:
+        if team["id"]:
+            name_to_teams.setdefault(team["id"].lower(), []).append(team)
+        if team["name"]:
+            name_to_teams.setdefault(team["name"].lower(), []).append(team)
+    for row in session_rows:
+        key = (row["project_id"], row["id"])
+        if key in session_assign:
+            continue
+        candidates = name_to_teams.get((row["team_id"] or "").lower(), [])
+        if len(candidates) == 1:
+            offer(key, candidates[0]["id"], "team_name")
+
+    for key, (team_id, confidence) in session_assign.items():
+        conn.execute(
+            "UPDATE sessions SET team_id = ?, team_confidence = ? WHERE project_id = ? AND id = ?",
+            (team_id, confidence, key[0], key[1]),
+        )
+    leads_by_team = {team["id"]: team["lead_session_id"] or "" for team in team_rows}
+    for (team_id, member_agent_id), (row, confidence) in member_claims.items():
+        conn.execute(
+            """
+            UPDATE team_members
+            SET session_id = ?, session_project_id = ?, match_confidence = ?
+            WHERE team_id = ? AND agent_id = ?
+            """,
+            (row["id"], row["project_id"], confidence, team_id, member_agent_id),
+        )
+        if row["id"] != leads_by_team.get(team_id):
+            # Member-level links (exact / meta_scope / lead_dir) mark the
+            # session as a teammate so kind="teammate" stays consistent with
+            # the member mapping. The lead session itself is exempt (it is
+            # resolved via leadSessionId), as is the team-only fallback.
+            conn.execute(
+                "UPDATE sessions SET task_kind = 'in_process_teammate' "
+                "WHERE project_id = ? AND id = ?",
+                (row["project_id"], row["id"]),
+            )
+
+    # Drop teams whose directory disappeared and clear dangling session links.
+    existing_ids = {row["id"] for row in conn.execute("SELECT id FROM teams")}
+    for stale in existing_ids - seen_team_ids:
+        conn.execute("DELETE FROM teams WHERE id = ?", (stale,))
+        conn.execute("DELETE FROM team_members WHERE team_id = ?", (stale,))
+    conn.execute(
+        """
+        UPDATE sessions
+        SET team_id = '', task_kind = '', team_confidence = ''
+        WHERE team_id != '' AND team_id NOT IN (SELECT id FROM teams)
+        """
+    )
+
+    # Aggregates are recomputed every scan, even for unchanged configs.
+    for team_id in sorted(existing_ids & seen_team_ids):
+        agg = conn.execute(
+            """
+            SELECT COUNT(*) AS session_count,
+                   COALESCE(SUM(total_msgs), 0) AS total_msgs,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                   COALESCE(MAX(last_active), '') AS last_active,
+                   (SELECT COUNT(*) FROM team_members WHERE team_members.team_id = ?) AS member_count
+            FROM sessions WHERE team_id = ?
+            """,
+            (team_id, team_id),
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE teams
+            SET session_count = ?, total_msgs = ?, total_tokens = ?,
+                last_active = ?, member_count = ?, indexed_at = ?
+            WHERE id = ?
+            """,
+            (
+                agg["session_count"], agg["total_msgs"], agg["total_tokens"],
+                agg["last_active"], agg["member_count"], now, team_id,
+            ),
+        )
+
+
 def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
     started = time.time()
     stats = {"projects": 0, "sessions": 0, "indexed": 0, "removed": 0, "orphan_history": 0, "duration_ms": 0}
@@ -811,6 +1228,7 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
 
         seen_files = set()
         direct_sessions = []
+        raw_team_meta = {}
         known_files = {
             row["path"]: row
             for row in conn.execute(
@@ -850,12 +1268,20 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                 except OSError:
                     continue
                 old = known_files.get(normalized_path)
+                # Teammate metadata (.meta.json) can change without touching the
+                # log, so read it every pass for nested files to keep the member
+                # columns fresh even when the JSONL is gated below.
+                agent_meta = _read_agent_meta(file_path) if parent_session_id else {}
+                if parent_session_id:
+                    raw_team_meta[(project_id, session_id)] = agent_meta
                 if (
                     not force
                     and old
                     and float(old["mtime"]) == float(st.st_mtime)
                     and int(old["size"]) == int(st.st_size)
                 ):
+                    if parent_session_id:
+                        _update_session_agent_meta(conn, project_id, session_id, agent_meta)
                     continue
 
                 # Subagent logs can be numerous and very large. Their role in the
@@ -896,11 +1322,12 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                     INSERT INTO sessions(
                         project_id, id, file_path, title, created_at, last_active, cwd, cwd_initial,
                         cwd_changed, model, user_msgs, assistant_msgs, total_msgs, input_tokens,
-                        output_tokens, cache_tokens, total_tokens, first_user_msg, indexed_at
-                        , session_kind, parent_project_id, parent_session_id, agent_id,
-                        relation_confidence, entrypoint, child_count, logical_project_id,
-                        path_exists, grouping_reason
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        output_tokens, cache_tokens, total_tokens, first_user_msg, session_kind,
+                        parent_project_id, parent_session_id, agent_id, relation_confidence,
+                        entrypoint, child_count, logical_project_id, path_exists, grouping_reason,
+                        agent_type, agent_name, agent_description, agent_color, task_kind,
+                        team_id, indexed_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
@@ -921,7 +1348,6 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                         meta["cache_tokens"],
                         meta["total_tokens"],
                         meta["first_user_msg"],
-                        now,
                         session_kind,
                         project_id if parent_session_id else "",
                         parent_session_id,
@@ -932,6 +1358,13 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                         project_id,
                         int(os.path.isdir(meta["cwd_initial"] or meta["cwd"])) if (meta["cwd_initial"] or meta["cwd"]) else 0,
                         "record_dir",
+                        agent_meta.get("agent_type", ""),
+                        agent_meta.get("agent_name", ""),
+                        agent_meta.get("agent_description", ""),
+                        agent_meta.get("agent_color", ""),
+                        agent_meta.get("task_kind", ""),
+                        agent_meta.get("team_id", ""),
+                        now,
                     ),
                 )
                 for message in messages:
@@ -994,6 +1427,33 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                 (project_id, parent_session_id, project_id, session_id),
             )
 
+        for row in known_files.values():
+            if row["path"] in seen_files and os.path.exists(row["path"]):
+                continue
+            conn.execute("DELETE FROM scan_files WHERE path = ?", (row["path"],))
+            conn.execute("DELETE FROM sessions WHERE project_id = ? AND id = ?", (row["project_id"], row["session_id"]))
+            conn.execute("DELETE FROM messages WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
+            conn.execute("DELETE FROM messages_fts WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
+            conn.execute("DELETE FROM api_usage_events WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
+            stats["removed"] += 1
+
+        # Reseed the team columns from the raw teammate metadata read this pass
+        # (clearing every other row), so the team cascade always derives from
+        # current evidence instead of feeding on its own previous output.
+        conn.execute(
+            "UPDATE sessions SET team_id = '', task_kind = '', team_confidence = '' "
+            "WHERE team_id != '' OR task_kind != '' OR team_confidence != ''"
+        )
+        for (project_id, session_id), agent_meta in raw_team_meta.items():
+            if not agent_meta.get("team_id") and not agent_meta.get("task_kind"):
+                continue
+            conn.execute(
+                "UPDATE sessions SET team_id = ?, task_kind = ?, team_confidence = '' "
+                "WHERE project_id = ? AND id = ?",
+                (agent_meta.get("team_id", ""), agent_meta.get("task_kind", ""), project_id, session_id),
+            )
+        _refresh_teams(conn, os.path.join(os.path.dirname(projects_dir), "teams"))
+
         conn.execute(
             """
             UPDATE sessions AS child
@@ -1005,16 +1465,6 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
             )
             """
         )
-
-        for row in known_files.values():
-            if row["path"] in seen_files and os.path.exists(row["path"]):
-                continue
-            conn.execute("DELETE FROM scan_files WHERE path = ?", (row["path"],))
-            conn.execute("DELETE FROM sessions WHERE project_id = ? AND id = ?", (row["project_id"], row["session_id"]))
-            conn.execute("DELETE FROM messages WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
-            conn.execute("DELETE FROM messages_fts WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
-            conn.execute("DELETE FROM api_usage_events WHERE project_id = ? AND session_id = ?", (row["project_id"], row["session_id"]))
-            stats["removed"] += 1
 
         index_changed = force or stats["indexed"] > 0 or stats["removed"] > 0
         if index_changed:
@@ -1074,6 +1524,7 @@ def dashboard(db_path, today=None):
                 """
                 SELECT
                     (SELECT COUNT(*) FROM projects) AS total_projects,
+                    (SELECT COUNT(*) FROM teams) AS total_teams,
                     (SELECT COUNT(*) FROM sessions WHERE session_kind = 'primary' AND parent_session_id = '') AS total_sessions,
                     (SELECT COUNT(*) FROM sessions WHERE session_kind != 'primary' OR parent_session_id != '') AS total_automatic_sessions,
                     (SELECT COUNT(*) FROM sessions) AS total_all_sessions,
@@ -1271,13 +1722,111 @@ def list_projects(db_path, q="", drive="", sort="active", path_prefix="", limit=
         conn.close()
 
 
+def list_teams(db_path, q="", limit=80, offset=0):
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        where = []
+        params = []
+        if q:
+            where.append("(lower(name) LIKE ? OR lower(cwd) LIKE ? OR lower(lead_agent_id) LIKE ?)")
+            like = "%" + q.lower() + "%"
+            params.extend([like, like, like])
+        where_sql = " WHERE " + " AND ".join(where) if where else ""
+        total = conn.execute("SELECT COUNT(*) AS c FROM teams" + where_sql, params).fetchone()["c"]
+        rows = []
+        for row in conn.execute(
+            f"""
+            SELECT teams.*,
+                   (SELECT s.cwd FROM sessions s WHERE s.id = teams.lead_session_id
+                    ORDER BY s.last_active DESC LIMIT 1) AS lead_cwd
+            FROM teams{where_sql} ORDER BY last_active DESC LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        ):
+            item = _row_dict(row)
+            # Display-only cwd derived from the indexed lead session; member
+            # cwd from the config is never persisted.
+            item["cwd"] = item.pop("lead_cwd") or ""
+            rows.append(item)
+        return {"items": rows, "total": total, "limit": limit, "offset": offset}
+    finally:
+        conn.close()
+
+
+def team_detail(db_path, team_id):
+    """Return one team with its lead session and member rows (sessions joined)."""
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        team = _row_dict(conn.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone())
+        if not team:
+            return None
+        lead = {"agent_id": team["lead_agent_id"], "session": None}
+        if team["lead_session_id"]:
+            lead_row = conn.execute(
+                """
+                SELECT s.*, p.name AS project_name
+                FROM sessions s
+                JOIN projects p ON p.id = s.logical_project_id
+                WHERE s.id = ?
+                ORDER BY s.last_active DESC
+                LIMIT 1
+                """,
+                (team["lead_session_id"],),
+            ).fetchone()
+            lead["session"] = _public_session(lead_row)
+            if lead_row:
+                # Config member cwd is display-only (never persisted), so the
+                # team cwd shown here derives from the already-indexed lead
+                # session instead of the config.
+                team["cwd"] = lead_row["cwd"] or team["cwd"]
+        members = []
+        for row in conn.execute(
+            "SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at ASC, name ASC",
+            (team_id,),
+        ):
+            member = {
+                "agent_id": row["agent_id"],
+                "name": row["name"],
+                "color": row["color"],
+                "joined_at": row["joined_at"],
+                "agent_type": row["agent_type"],
+                "confidence": row["match_confidence"],
+                "session": None,
+                "logical_project_id": "",
+                "record_project_id": "",
+            }
+            if row["session_id"]:
+                session_row = conn.execute(
+                    """
+                    SELECT s.*, p.name AS project_name
+                    FROM sessions s
+                    JOIN projects p ON p.id = s.logical_project_id
+                    WHERE s.project_id = ? AND s.id = ?
+                    """,
+                    (row["session_project_id"], row["session_id"]),
+                ).fetchone()
+                if session_row:
+                    public = _public_session(session_row)
+                    member["session"] = public
+                    member["logical_project_id"] = public["project_id"]
+                    member["record_project_id"] = public["record_project_id"]
+            members.append(member)
+        return {"team": team, "lead": lead, "members": members}
+    finally:
+        conn.close()
+
+
 def _attach_children(conn, rows):
     for row in rows:
         record_project_id = row.get("record_project_id") or row.get("project_id")
         children = [_public_session(child) for child in conn.execute(
             """
-            SELECT s.*, p.name AS project_name
-            FROM sessions s JOIN projects p ON p.id = s.logical_project_id
+            SELECT s.*, p.name AS project_name, t.name AS team_name
+            FROM sessions s
+            JOIN projects p ON p.id = s.logical_project_id
+            LEFT JOIN teams t ON t.id = s.team_id
             WHERE s.parent_project_id = ? AND s.parent_session_id = ?
             ORDER BY s.last_active DESC
             """,
@@ -1296,8 +1845,10 @@ def _attach_parents(conn, rows):
             continue
         parent = conn.execute(
             """
-            SELECT s.*, p.name AS project_name
-            FROM sessions s JOIN projects p ON p.id = s.logical_project_id
+            SELECT s.*, p.name AS project_name, t.name AS team_name
+            FROM sessions s
+            JOIN projects p ON p.id = s.logical_project_id
+            LEFT JOIN teams t ON t.id = s.team_id
             WHERE s.project_id = ? AND s.id = ?
             """,
             (row.get("parent_project_id") or row.get("record_project_id") or "", parent_session_id),
@@ -1315,17 +1866,20 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, k
         ``automatic_items`` — the historical behavior.
       - "automatic": every automatic session (job / sdk / subagent) as a flat
         list, each carrying parent info when known.
+      - "teammate": every in-process teammate session as a flat list, each
+        carrying its team info.
       - "all": primary + automatic in one flat, paginated list without nesting,
         so the same automatic session never appears twice.
 
     Counts (``primary_total`` / ``automatic_total`` / ``automatic_all_total`` /
-    ``related_total``) always describe the full project (plus the query filter),
-    independent of the selected kind, so callers can label sections correctly.
+    ``teammate_total`` / ``related_total``) always describe the full project
+    (plus the query filter), independent of the selected kind, so callers can
+    label sections correctly.
     """
     conn = connect(db_path)
     try:
         init_db(conn)
-        kind = kind if kind in ("all", "primary", "automatic") else "primary"
+        kind = kind if kind in ("all", "primary", "automatic", "teammate") else "primary"
         base_where, base_params = [], []
         if project_id:
             base_where.append("s.logical_project_id = ?")
@@ -1340,13 +1894,16 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, k
             kind_where = ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
         elif kind == "automatic":
             kind_where = ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
+        elif kind == "teammate":
+            kind_where = ["s.task_kind = 'in_process_teammate'"]
         where_sql = " WHERE " + " AND ".join(base_where + kind_where) if (base_where or kind_where) else ""
         total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + where_sql, base_params).fetchone()["c"]
         rows = [_public_session(r) for r in conn.execute(
             f"""
-            SELECT s.*, p.name AS project_name
+            SELECT s.*, p.name AS project_name, t.name AS team_name
             FROM sessions s
             JOIN projects p ON p.id = s.logical_project_id
+            LEFT JOIN teams t ON t.id = s.team_id
             {where_sql}
             ORDER BY s.last_active DESC
             LIMIT ? OFFSET ?
@@ -1366,6 +1923,10 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, k
             base_where + ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
         )
         automatic_all_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + automatic_all_where, base_params).fetchone()["c"]
+        teammate_where = " WHERE " + " AND ".join(
+            base_where + ["s.task_kind = 'in_process_teammate'"]
+        )
+        teammate_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + teammate_where, base_params).fetchone()["c"]
         automatic_unattached_where = " WHERE " + " AND ".join(
             base_where + ["s.session_kind != 'primary'", "s.parent_session_id = ''"]
         )
@@ -1388,6 +1949,7 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, k
             "primary_total": primary_total,
             "automatic_total": automatic_unattached_total,
             "automatic_all_total": automatic_all_total,
+            "teammate_total": teammate_total,
             "related_total": automatic_all_total,
             "limit": limit,
             "offset": offset,
@@ -1420,9 +1982,10 @@ def session_detail(db_path, project_id, session_id, limit=160, offset=0, role=""
         init_db(conn)
         session = _public_session(conn.execute(
             """
-            SELECT s.*, p.name AS project_name
+            SELECT s.*, p.name AS project_name, t.name AS team_name
             FROM sessions s
             JOIN projects p ON p.id = s.logical_project_id
+            LEFT JOIN teams t ON t.id = s.team_id
             WHERE s.logical_project_id = ? AND s.id = ?
             """,
             (project_id, session_id),
@@ -1566,7 +2129,9 @@ def search(db_path, q, limit=50, offset=0):
             SELECT 'session' AS type, s.logical_project_id AS project_id,
                    s.project_id AS record_project_id, s.id AS session_id, s.title,
                    s.cwd AS path, '' AS role, s.first_user_msg AS snippet, s.last_active,
-                   s.session_kind, s.parent_project_id, s.parent_session_id,
+                   s.session_kind, s.task_kind,
+                   (SELECT t.name FROM teams t WHERE t.id = s.team_id) AS team_name,
+                   s.parent_project_id, s.parent_session_id,
                    s.path_exists, s.grouping_reason,
                    (SELECT ps.title FROM sessions ps
                     WHERE ps.project_id = s.parent_project_id AND ps.id = s.parent_session_id
@@ -1588,7 +2153,9 @@ def search(db_path, q, limit=50, offset=0):
                        s.project_id AS record_project_id, f.session_id, f.title,
                        f.path, f.role,
                        snippet(messages_fts, 5, '<mark>', '</mark>', '...', 12) AS snippet,
-                       s.last_active, s.session_kind, s.parent_project_id, s.parent_session_id,
+                       s.last_active, s.session_kind, s.task_kind,
+                       (SELECT t.name FROM teams t WHERE t.id = s.team_id) AS team_name,
+                       s.parent_project_id, s.parent_session_id,
                        s.path_exists, s.grouping_reason,
                        (SELECT ps.title FROM sessions ps
                         WHERE ps.project_id = s.parent_project_id AND ps.id = s.parent_session_id
