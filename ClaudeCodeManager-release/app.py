@@ -116,8 +116,8 @@ DEFAULT_API_CONFIG = {
 
 DEFAULT_QL_PATH = os.path.expanduser("~")
 
-APP_VERSION = "v2.0-preview.14"
-APP_UI_VERSION = "v2.0-preview.14"
+APP_VERSION = "v2.0-preview.15"
+APP_UI_VERSION = "v2.0-preview.15"
 # The index is a rebuildable cache shared by source and packaged launches.
 # Keeping it outside EXE_DIR prevents the two launch modes from drifting apart.
 INDEX_DATA_DIR = (
@@ -324,6 +324,29 @@ def _safe_project_path(project_id, session_id=None):
             return None, None
         return folder, sf
     return folder, None
+
+
+def _resolve_session_file(project_id, session_id):
+    """Resolve a session's physical JSONL path with the same safety rules as
+    _safe_project_path, preferring the path recorded in the index.
+
+    Nested subagent logs (<project>/<parent>/subagents/agent-*.jsonl) do not
+    live at the conventional <project>/<session>.jsonl location, so their
+    indexed file_path is the only reliable resolution. Returns None when the
+    resolved path escapes PROJECTS_DIR."""
+    indexed_path, record = "", ""
+    try:
+        indexed_path, record = v2_index.session_file_path(INDEX_DB_FILE, project_id, session_id)
+    except Exception:
+        indexed_path = ""
+    if indexed_path:
+        projects_root = os.path.realpath(PROJECTS_DIR)
+        folder = os.path.realpath(os.path.join(PROJECTS_DIR, record or project_id))
+        target = os.path.realpath(indexed_path)
+        if target.startswith(projects_root + os.sep) and target.startswith(folder + os.sep):
+            return target
+    _, filepath = _safe_project_path(project_id, session_id)
+    return filepath
 
 
 def _read_jsonl(filepath, max_entries=None):
@@ -1458,6 +1481,7 @@ class Handler(BaseHTTPRequestHandler):
                     q=((qs.get("q") or [""])[0]).strip(),
                     limit=self._q_int(qs, "limit", 80, 1, 200),
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
+                    kind=((qs.get("kind") or ["primary"])[0]).strip().lower(),
                 )
                 attach_session_summaries(data.get("items", []))
                 self._send_json(data)
@@ -1490,6 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
                     q=((qs.get("q") or [""])[0]).strip(),
                     limit=self._q_int(qs, "limit", 80, 1, 200),
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
+                    kind=((qs.get("kind") or ["primary"])[0]).strip().lower(),
                 )
                 attach_session_summaries(data.get("items", []))
                 self._send_json(data)
@@ -1506,6 +1531,8 @@ class Handler(BaseHTTPRequestHandler):
                     limit=self._q_int(qs, "limit", 160, 1, 300),
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
                     role=((qs.get("role") or [""])[0]).strip(),
+                    read_jsonl=_read_jsonl,
+                    fix_text=_fix_mojibake,
                 )
                 if not detail:
                     self._send_json({"error": "session not found"}, 404)
@@ -1631,7 +1658,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "message": "无效的项目或会话 ID"}, 400)
             return
         project_id = v2_index.record_project_id(INDEX_DB_FILE, project_id, session_id)
-        _, filepath = _safe_project_path(project_id, session_id)
+        filepath = _resolve_session_file(project_id, session_id)
         if not filepath or not os.path.isfile(filepath):
             self._send_json({"ok": False, "message": "会话文件不存在"}, 404)
             return
@@ -1732,7 +1759,7 @@ class Handler(BaseHTTPRequestHandler):
                 errors.append(str(session_id) + ": 无效的 session_id")
                 continue
             record_project_id = v2_index.record_project_id(INDEX_DB_FILE, project_id, session_id)
-            _, filepath = _safe_project_path(record_project_id, session_id)
+            filepath = _resolve_session_file(record_project_id, session_id)
             if not filepath or not os.path.isfile(filepath):
                 failed += 1
                 errors.append(session_id + ": 会话文件不存在")
@@ -2370,7 +2397,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_delete_session(self):
-        """Delete a single session file."""
+        """Delete a single session file (including nested subagent logs)."""
         length = int(self.headers.get("Content-Length", 0))
         try:
             data = json.loads(self.rfile.read(length))
@@ -2386,19 +2413,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "message": "无效的ID"}, 400)
             return
 
-        filepath = os.path.join(PROJECTS_DIR, project_id, session_id + ".jsonl")
-        if not os.path.isfile(filepath):
+        request_project_id = project_id
+        project_id = v2_index.record_project_id(INDEX_DB_FILE, project_id, session_id)
+        filepath = _resolve_session_file(project_id, session_id)
+        if not filepath or not os.path.isfile(filepath):
             self._send_json({"ok": False, "message": "会话文件不存在"}, 404)
             return
 
         try:
             os.remove(filepath)
             sums = load_session_summaries()
-            key = project_id + "/" + session_id
-            if key in sums:
-                sums.pop(key, None)
+            changed = False
+            for key in (request_project_id + "/" + session_id, project_id + "/" + session_id):
+                if key in sums:
+                    sums.pop(key, None)
+                    changed = True
+            if changed:
                 save_session_summaries(sums)
             invalidate_project_cache()
+            ensure_v2_index(force=True)
             return self._send_json({"ok": True, "message": "会话已删除"})
         except Exception as e:
             return self._send_json({"ok": False, "message": str(e)}, 500)
@@ -2430,7 +2463,8 @@ class Handler(BaseHTTPRequestHandler):
                 failed += 1
                 errors.append(str(session_id) + ": 无效的会话ID")
                 continue
-            _, filepath = _safe_project_path(project_id, session_id)
+            record_project_id = v2_index.record_project_id(INDEX_DB_FILE, project_id, session_id)
+            filepath = _resolve_session_file(record_project_id, session_id)
             if not filepath or not os.path.isfile(filepath):
                 failed += 1
                 errors.append(session_id + ": 会话文件不存在")
@@ -2439,12 +2473,14 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(filepath)
                 deleted += 1
                 sums.pop(project_id + "/" + session_id, None)
+                sums.pop(record_project_id + "/" + session_id, None)
             except Exception as e:
                 failed += 1
                 errors.append(session_id + ": " + str(e))
 
         save_session_summaries(sums)
         invalidate_project_cache()
+        ensure_v2_index(force=True)
         self._send_json({
             "ok": failed == 0,
             "deleted": deleted,

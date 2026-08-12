@@ -130,6 +130,195 @@ class LogicalProjectIndexTests(unittest.TestCase):
         self.assertEqual(v2_index.list_orphan_history_sessions(self.db)["total"], 0)
 
 
+class AutomaticSessionIndexTests(unittest.TestCase):
+    """Cover job / sdk / subagent sessions: listing, detail, search and stats."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.projects = os.path.join(self.temp.name, "projects")
+        self.record_id = "D--Auto"
+        self.record_dir = os.path.join(self.projects, self.record_id)
+        os.makedirs(self.record_dir)
+        self.cwd = os.path.join(self.temp.name, "auto-project")
+        os.makedirs(self.cwd)
+        self.db = os.path.join(self.temp.name, "index.sqlite3")
+        self.primary_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        self.job_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        self.sdk_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        # The synthetic id is <parent>--<agent file base name>, e.g. ...--agent-0001
+        self.agent_name = "agent-0001"
+        self.subagent_id = self.primary_id + "--" + self.agent_name
+
+        self._write_session(self.primary_id, "主会话标题")
+        self._write_session(self.job_id, "后台任务标题", entrypoint=None)
+        self._write_session(self.sdk_id, "SDK 自动任务标题", entrypoint="sdk-cli")
+
+        jobs_dir = os.path.join(self.temp.name, "jobs")
+        state_path = os.path.join(jobs_dir, "job-1", "state.json")
+        os.makedirs(os.path.dirname(state_path))
+        with open(state_path, "w", encoding="utf-8") as stream:
+            json.dump({"sessionId": self.job_id}, stream)
+
+        self.subagent_path = os.path.join(
+            self.record_dir, self.primary_id, "subagents", self.agent_name + ".jsonl"
+        )
+        os.makedirs(os.path.dirname(self.subagent_path))
+        with open(self.subagent_path, "w", encoding="utf-8") as stream:
+            for row in [
+                {
+                    "type": "user", "timestamp": 1700000004000, "cwd": self.cwd,
+                    "message": {"role": "user", "content": "子代理收到的指令"},
+                },
+                {
+                    "type": "assistant", "timestamp": 1700000005000, "cwd": self.cwd,
+                    "message": {"role": "assistant", "model": "deepseek-v4-pro", "content": "子代理的回复",
+                                "usage": {"input_tokens": 30, "output_tokens": 10}},
+                },
+            ]:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        v2_index.scan_incremental(self.db, self.projects, read_jsonl, fix_text)
+        self.logical_id = v2_index.list_projects(self.db)["items"][0]["id"]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_session(self, session_id, title, entrypoint="cli"):
+        path = os.path.join(self.record_dir, session_id + ".jsonl")
+        row = {
+            "type": "user", "uuid": session_id, "timestamp": 1700000000000,
+            "cwd": self.cwd, "message": {"role": "user", "content": title},
+        }
+        if entrypoint is not None:
+            row["entrypoint"] = entrypoint
+        with open(path, "w", encoding="utf-8") as stream:
+            for entry in [row, {"type": "ai-title", "aiTitle": title}]:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def test_list_sessions_defaults_to_primary_only(self):
+        data = v2_index.list_sessions(self.db, project_id=self.logical_id)
+        self.assertEqual(data["kind"], "primary")
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["items"][0]["session_kind"], "primary")
+        self.assertEqual(data["primary_total"], 1)
+        self.assertEqual(data["automatic_all_total"], 3)
+        self.assertEqual(data["automatic_total"], 2)
+        self.assertEqual(len(data["automatic_items"]), 2)
+
+    def test_list_sessions_kind_primary_returns_only_primaries(self):
+        data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="primary")
+        self.assertEqual(data["total"], 1)
+        self.assertTrue(all(row["session_kind"] == "primary" for row in data["items"]))
+
+    def test_list_sessions_kind_all_includes_every_automatic_kind(self):
+        data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="all")
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(
+            {row["session_kind"] for row in data["items"]},
+            {"primary", "job", "sdk", "subagent"},
+        )
+        subagent = next(row for row in data["items"] if row["session_kind"] == "subagent")
+        self.assertEqual(subagent["parent_session_id"], self.primary_id)
+        self.assertEqual(subagent["parent"]["id"], self.primary_id)
+        # flat mode must not nest children, so nothing appears twice
+        for row in data["items"]:
+            self.assertNotIn("children", row)
+
+    def test_list_sessions_kind_automatic_returns_job_sdk_subagent(self):
+        data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="automatic")
+        self.assertEqual(data["total"], 3)
+        self.assertEqual(
+            {row["session_kind"] for row in data["items"]},
+            {"job", "sdk", "subagent"},
+        )
+        job = next(row for row in data["items"] if row["session_kind"] == "job")
+        self.assertEqual(job["parent_session_id"], "")
+        self.assertIsNone(job["parent"])
+        subagent = next(row for row in data["items"] if row["session_kind"] == "subagent")
+        self.assertEqual(subagent["parent"]["id"], self.primary_id)
+
+    def test_unknown_kind_falls_back_to_primary(self):
+        data = v2_index.list_sessions(self.db, project_id=self.logical_id, kind="bogus")
+        self.assertEqual(data["kind"], "primary")
+        self.assertEqual(data["total"], 1)
+
+    def test_session_detail_opens_job_session_with_indexed_messages(self):
+        detail = v2_index.session_detail(self.db, self.logical_id, self.job_id)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["session"]["session_kind"], "job")
+        self.assertEqual(detail["messages_source"], "index")
+        self.assertFalse(detail["stats_on_demand"])
+        self.assertEqual(detail["total"], 1)
+        self.assertEqual(detail["messages"][0]["role"], "user")
+
+    def test_session_detail_reads_subagent_messages_on_demand(self):
+        detail = v2_index.session_detail(self.db, self.logical_id, self.subagent_id)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["session"]["session_kind"], "subagent")
+        self.assertEqual(detail["messages_source"], "jsonl")
+        self.assertTrue(detail["stats_on_demand"])
+        self.assertEqual(detail["total"], 2)
+        self.assertEqual(detail["messages"][0]["role"], "user")
+        self.assertEqual(detail["session"]["parent"]["id"], self.primary_id)
+        # stats are recomputed from the full log, not the capped index row
+        self.assertEqual(detail["session"]["total_tokens"], 40)
+        self.assertEqual(detail["session"]["total_msgs"], 2)
+
+    def test_session_detail_subagent_paginates_on_demand(self):
+        detail = v2_index.session_detail(self.db, self.logical_id, self.subagent_id, limit=1, offset=1)
+        self.assertEqual(detail["total"], 2)
+        self.assertEqual(len(detail["messages"]), 1)
+        self.assertEqual(detail["messages"][0]["role"], "assistant")
+
+    def test_session_detail_subagent_missing_file_reports_unavailable(self):
+        os.remove(self.subagent_path)
+        detail = v2_index.session_detail(self.db, self.logical_id, self.subagent_id)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["messages_source"], "unavailable")
+        self.assertEqual(detail["total"], 0)
+        self.assertEqual(detail["messages"], [])
+
+    def test_automatic_session_with_and_without_parent_both_resolve(self):
+        job = v2_index.session_detail(self.db, self.logical_id, self.job_id)
+        self.assertIsNone(job["session"]["parent"])
+        subagent = v2_index.session_detail(self.db, self.logical_id, self.subagent_id)
+        self.assertEqual(subagent["session"]["parent"]["id"], self.primary_id)
+
+    def test_search_finds_automatic_sessions_with_kind_and_parent(self):
+        rows = [row for row in v2_index.search(self.db, "后台任务")["items"] if row["type"] == "session"]
+        job = next(row for row in rows if row["session_id"] == self.job_id)
+        self.assertEqual(job["session_kind"], "job")
+        self.assertEqual(job["project_id"], self.logical_id)
+        self.assertEqual(job["record_project_id"], self.record_id)
+
+        rows = [row for row in v2_index.search(self.db, "子代理")["items"] if row["type"] == "session"]
+        subagent = next(row for row in rows if row["session_id"] == self.subagent_id)
+        self.assertEqual(subagent["session_kind"], "subagent")
+        self.assertEqual(subagent["parent_title"], "主会话标题")
+
+    def test_search_result_opens_automatic_session_detail(self):
+        rows = [row for row in v2_index.search(self.db, "后台任务")["items"] if row["type"] == "session"]
+        job = next(row for row in rows if row["session_id"] == self.job_id)
+        self.assertEqual(job["project_id"], self.logical_id)
+        detail = v2_index.session_detail(self.db, job["project_id"], job["session_id"])
+        self.assertEqual(detail["session"]["id"], self.job_id)
+        self.assertEqual(detail["session"]["session_kind"], "job")
+
+    def test_project_counts_keep_primary_and_automatic_separate(self):
+        projects = v2_index.list_projects(self.db)["items"]
+        self.assertEqual(len(projects), 1)
+        project = projects[0]
+        self.assertEqual(project["session_count"], 1)
+        self.assertEqual(project["automatic_session_count"], 3)
+        self.assertEqual(project["all_session_count"], 4)
+
+    def test_dashboard_counts_automatic_sessions(self):
+        stats = v2_index.dashboard(self.db)["stats"]
+        self.assertEqual(stats["total_sessions"], 1)
+        self.assertEqual(stats["total_automatic_sessions"], 3)
+        self.assertEqual(stats["total_all_sessions"], 4)
+
+
 class DashboardStatsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
