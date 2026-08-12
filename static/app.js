@@ -132,7 +132,7 @@ const state = {
   usagePollTimer: null,
   usagePollInFlight: false,
   projects: { q: "", drive: "", sort: "active", offset: 0, limit: 50, dirParts: [], data: null, dirs: null },
-  sessions: { q: "", offset: 0, limit: 60 },
+  sessions: { q: "", offset: 0, limit: 60, kind: "all" },
   selectedProjects: new Set(),
   selectedSessions: new Map(),
   projectViews: new Map(),
@@ -159,6 +159,10 @@ function formatUsd(value) {
 function shortPath(value) {
   const clean = String(value || "").replace(/\//g, "\\").replace(/\\+$/, "");
   return clean.split("\\").pop() || clean || "未命名";
+}
+function truncateText(value, max = 20) {
+  const text = String(value || "");
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 function normalizePath(value) { return String(value || "").replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase(); }
 function selectedSessionSet(projectId) {
@@ -301,12 +305,12 @@ function sessionKindLabel(kind) {
   return { subagent: "Subagent", job: "后台 Job", sdk: "SDK 自动会话" }[kind] || "主会话";
 }
 
-function sessionEntry(session, { selectable = false, compact = false } = {}) {
+function sessionEntry(session, { selectable = false, compact = false, hideChildren = false } = {}) {
   const sessionId = session.id || session.session_id || "";
   const projectId = session.project_id || "";
   const recordProjectId = session.record_project_id || projectId;
   const isPrimary = (session.session_kind || "primary") === "primary" && !session.parent_session_id;
-  const canSelect = selectable && isPrimary;
+  const canSelect = selectable;
   const row = h("div", {
     className: `list-row${canSelect ? " has-check" : " is-clickable"}${compact ? " is-child-session" : ""}`,
     dataset: canSelect ? undefined : { action: "open-session", projectId, sessionId },
@@ -320,7 +324,12 @@ function sessionEntry(session, { selectable = false, compact = false } = {}) {
     })));
   }
   const titleLine = h("div", { className: "row-title-line" }, h("span", { className: "row-title", text: session.title || sessionId }));
-  if (!isPrimary) titleLine.append(tag(sessionKindLabel(session.session_kind), session.relation_confidence === "exact" ? "success" : "info"));
+  if (!isPrimary) {
+    titleLine.append(tag(sessionKindLabel(session.session_kind), session.relation_confidence === "exact" ? "success" : "info"));
+    if (session.parent) titleLine.append(tag(`父会话 · ${truncateText(session.parent.title || session.parent.id, 20)}`, "success"));
+    else if (session.parent_session_id) titleLine.append(tag("父会话缺失", "warning"));
+    else if (!compact) titleLine.append(tag("未关联父会话", "warning"));
+  }
   if (session.child_count) titleLine.append(tag(`下属 ${session.child_count}`, "info"));
   if (session.cwd_changed) titleLine.append(tag("CWD 变化", "warning"));
   if (session.grouping_reason === "cwd_collision") titleLine.append(tag("已纠正归类", "info"));
@@ -337,12 +346,16 @@ function sessionEntry(session, { selectable = false, compact = false } = {}) {
   const side = h("div", { className: "row-side" },
     h("div", { className: "metric" }, h("strong", { text: formatNumber(session.total_tokens) }), h("span", { text: "tokens" })),
     h("div", { className: "metric" }, h("strong", { text: formatNumber(session.total_msgs) }), h("span", { text: "消息" })),
-    isPrimary ? button("恢复", "open-launch", { kind: "secondary", iconName: "play", small: true, dataset: { launchKey } }) : h("span", { className: "auto-session-note", text: "仅查看" })
+    isPrimary
+      ? button("恢复", "open-launch", { kind: "secondary", iconName: "play", small: true, dataset: { launchKey } })
+      : h("div", { className: "auto-side" },
+          h("span", { className: "auto-session-note", text: "仅查看" }),
+          button("回收站", "trash-session", { kind: "danger", iconName: "trash", small: true, dataset: { projectId, sessionId } }))
   );
   row.append(open, side);
   const nodes = [row];
   if (session.ai_summary) nodes.push(h("details", { className: "summary-accordion" }, h("summary", { text: "查看 AI 摘要" }), h("p", { text: session.ai_summary })));
-  if (!compact && (session.children || []).length) {
+  if (!compact && !hideChildren && (session.children || []).length) {
     const childList = h("div", { className: "list child-session-list" });
     session.children.forEach((child) => childList.append(...sessionEntry(child, { compact: true })));
     nodes.push(h("details", { className: "child-session-group" },
@@ -351,17 +364,6 @@ function sessionEntry(session, { selectable = false, compact = false } = {}) {
     ));
   }
   return nodes;
-}
-
-function automaticSessionsPanel(data, { selectable = false } = {}) {
-  const items = data.automatic_items || [];
-  if (!items.length) return h("div", { hidden: true });
-  const list = h("div", { className: "list child-session-list" });
-  items.forEach((session) => list.append(...sessionEntry(session, { selectable, compact: true })));
-  return h("details", { className: "automatic-session-group" },
-    h("summary", {}, h("div", {}, h("strong", { text: `未关联的自动会话 ${data.automatic_total || items.length} 个` }), h("p", { text: "已识别为 Job 或 SDK 会话，但没有足够证据确定母会话。" }))),
-    list
-  );
 }
 
 function projectRow(project, description = null) {
@@ -374,7 +376,7 @@ function projectRow(project, description = null) {
   if (mapping) titleLine.append(tag("已重定向", "info"));
   if (project.grouping_reason === "cwd_collision") titleLine.append(tag("编码碰撞·已拆分", "info"));
   if (project.path_exists === 0 && !mapping) titleLine.append(tag("目录疑似已移动", "warning"));
-  if (project.automatic_session_count) titleLine.append(tag(`自动/下属 ${project.automatic_session_count}`, "info"));
+  if (project.automatic_session_count) titleLine.append(tag(`自动/下属 ${project.automatic_session_count} · 全部 ${project.all_session_count ?? (Number(project.session_count || 0) + Number(project.automatic_session_count || 0))}`, "info"));
   const virtualProject = projectId !== (project.record_project_id || projectId);
   return h("div", { className: "list-row has-check" },
     h("label", { className: "check-wrap", ariaLabel: virtualProject ? "逻辑项目不能执行物理目录批量操作" : "选择项目" }, h("input", { type: "checkbox", disabled: virtualProject, checked: state.selectedProjects.has(projectId), dataset: { change: "select-project", projectId } })),
@@ -385,7 +387,7 @@ function projectRow(project, description = null) {
       rowMeta([{ icon: "clock", text: `最近活跃 ${project.last_active || "未知"}` }])
     ),
     h("div", { className: "row-side" },
-      h("div", { className: "metric" }, h("strong", { text: formatNumber(project.session_count) }), h("span", { text: "会话" })),
+      h("div", { className: "metric" }, h("strong", { text: formatNumber(project.session_count) }), h("span", { text: "主会话" })),
       h("div", { className: "metric" }, h("strong", { text: formatNumber(project.total_tokens) }), h("span", { text: "tokens" })),
       h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight"))
     )
@@ -620,17 +622,27 @@ async function renderSessions(token) {
   setBreadcrumbs([{ label: "跨项目会话" }]);
   const view = state.sessions;
   const [data, orphanData] = await Promise.all([
-    api(`/api/v2/sessions?q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
+    api(`/api/v2/sessions?kind=${encode(view.kind)}&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
     api(`/api/v2/orphan-history-sessions?q=${encode(view.q)}&limit=80`)
   ]);
   if (token !== state.renderToken) return;
+  const kindSelect = h("select", { id: "session-kind", dataset: { change: "session-filter" } },
+    ...[["all", "全部会话"], ["primary", "主会话"], ["automatic", "自动会话"]].map(([value, label]) => h("option", { value, text: label, selected: view.kind === value }))
+  );
   const toolbar = h("div", { className: "toolbar" },
     h("label", { className: "field field-grow" }, h("span", { text: "会话关键词" }), h("input", { id: "session-query", value: view.q, placeholder: "搜索标题、首条消息或目录…", dataset: { enter: "session-filter" } })),
+    h("label", { className: "field" }, h("span", { text: "会话类型" }), kindSelect),
     button("搜索", "session-filter", { kind: "primary", iconName: "search" })
   );
   const list = h("div", { className: "list" });
   (data.items || []).forEach((session) => list.append(...sessionEntry(session)));
-  if (!(data.items || []).length) list.append(emptyState("没有匹配会话", "换一个关键词，或重建索引后再试。", "message"));
+  const panelMeta = {
+    all: ["全部会话", `${formatNumber(data.total)} 个会话 · 主会话 ${formatNumber(data.primary_total)} · 自动会话 ${formatNumber(data.automatic_all_total)}`],
+    primary: ["主会话列表", `${formatNumber(data.total)} 个主会话`],
+    automatic: ["自动会话", `${formatNumber(data.total)} 个自动会话（Job / SDK / Subagent）`],
+  }[view.kind] || ["主会话列表", `${formatNumber(data.total)} 个主会话`];
+  const emptyText = { all: "没有匹配会话", primary: "没有匹配主会话", automatic: "没有匹配的自动会话" }[view.kind] || "没有匹配会话";
+  if (!(data.items || []).length) list.append(emptyState(emptyText, "换一个关键词，或重建索引后再试。", "message"));
   const orphanList = h("div", { className: "list" });
   (orphanData.items || []).forEach((session) => orphanList.append(h("div", { className: "list-row" },
     h("div", { className: "list-main" },
@@ -641,11 +653,10 @@ async function renderSessions(token) {
   )));
   if (!(orphanData.items || []).length) orphanList.append(emptyState("没有待恢复历史会话", "当前 history 记录均能找到对应主会话。", "message"));
   pageRoot.replaceChildren(
-    pageHeading("Sessions", "跨项目会话", "服务端分页加载最近会话，不扫描全部 JSONL。"),
+    pageHeading("Sessions", "跨项目会话", "服务端分页加载会话；可按类型筛选，自动会话（Job / SDK / Subagent）默认随全部会话展示。"),
     toolbar,
-    panel("主会话列表", `${formatNumber(data.total)} 个主会话`, h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "sessions"))),
-    panel("待恢复历史会话", `${formatNumber(orphanData.total || 0)} 个候选；仅提示，不会自动重建或重定向`, orphanList),
-    automaticSessionsPanel(data)
+    panel(panelMeta[0], panelMeta[1], h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "sessions"))),
+    panel("待恢复历史会话", `${formatNumber(orphanData.total || 0)} 个候选；仅提示，不会自动重建或重定向`, orphanList)
   );
 }
 
@@ -654,17 +665,19 @@ async function renderProject(token, projectId, force = false) {
   state.projectViews.set(projectId, view);
   let projectData = state.projectData.get(projectId);
   if (!projectData || force) {
-    const [sessions, descriptions, mappings] = await Promise.all([
-      api(`/api/v2/project/${encode(projectId)}/sessions?q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
+    const [sessions, automatic, descriptions, mappings] = await Promise.all([
+      api(`/api/v2/project/${encode(projectId)}/sessions?kind=primary&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
+      api(`/api/v2/project/${encode(projectId)}/sessions?kind=automatic&q=${encode(view.q)}&limit=200&offset=0`),
       api("/api/descriptions"),
       api("/api/v2/path-mappings")
     ]);
-    projectData = { sessions, descriptions, mappings };
+    projectData = { sessions, automatic, descriptions, mappings };
     state.projectData.set(projectId, projectData);
     state.pathMappings = mappings || { mappings: {} };
   }
   if (token !== state.renderToken) return;
   const sessions = projectData.sessions || {};
+  const automatic = projectData.automatic || {};
   const first = (sessions.items || [])[0] || {};
   const path = state.projectNames.get(projectId) || first.project_name || first.cwd_initial || first.cwd || projectId;
   state.projectNames.set(projectId, path);
@@ -679,7 +692,7 @@ async function renderProject(token, projectId, force = false) {
   const launchKey = registerLaunchContext({ kind: "project", projectId, path: oldPathMapping ? mappedPath(path, oldPathMapping) : path, label: shortPath(path) });
   const tabs = h("div", { className: "tabs", role: "tablist", ariaLabel: "项目详情页签" });
   [["sessions", "会话列表"], ["location", "目录重定向与迁移"], ["ai", "AI 洞察与操作"], ["danger", "危险区域"]].forEach(([id, label]) => tabs.append(h("button", { type: "button", role: "tab", className: `tab-button${activeTab === id ? " is-active" : ""}`, ariaSelected: activeTab === id, text: label, dataset: { action: "project-tab", tab: id, projectId } })));
-  const content = activeTab === "sessions" ? projectSessionsTab(projectId, sessions, view) : activeTab === "location" ? projectLocationTab(projectId, path, mapping, virtualProject) : activeTab === "ai" ? projectAiTab(projectId, projectData.descriptions || {}, sessions.total || 0, virtualProject) : projectDangerTab(projectId, path, virtualProject);
+  const content = activeTab === "sessions" ? projectSessionsTab(projectId, sessions, automatic, view) : activeTab === "location" ? projectLocationTab(projectId, path, mapping, virtualProject) : activeTab === "ai" ? projectAiTab(projectId, projectData.descriptions || {}, sessions.total || 0, virtualProject) : projectDangerTab(projectId, path, virtualProject);
   pageRoot.replaceChildren(
     pageHeading("Project", shortPath(path), path, [
       button("打开项目目录", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openDirectoryPath } }),
@@ -688,7 +701,8 @@ async function renderProject(token, projectId, force = false) {
     h("div", { className: "project-summary-strip" },
       h("div", { className: "summary-metric path" }, h("span", { text: "项目路径" }), h("strong", { text: mapping?.new_path || path, title: mapping?.new_path || path })),
       h("div", { className: "summary-metric" }, h("span", { text: "主会话" }), h("strong", { text: formatNumber(sessions.total || meta.session_count) })),
-      h("div", { className: "summary-metric" }, h("span", { text: "自动/下属" }), h("strong", { text: formatNumber(sessions.related_total || 0) })),
+      h("div", { className: "summary-metric" }, h("span", { text: "自动会话" }), h("strong", { text: formatNumber(automatic.total || 0) })),
+      h("div", { className: "summary-metric" }, h("span", { text: "全部会话" }), h("strong", { text: formatNumber((sessions.total || 0) + (automatic.total || 0)) })),
       h("div", { className: "summary-metric" }, h("span", { text: "Token（输入+输出）" }), h("strong", { text: meta.total_tokens === undefined ? "—" : formatNumber(meta.total_tokens) }))
     ),
     tabs,
@@ -696,15 +710,24 @@ async function renderProject(token, projectId, force = false) {
   );
 }
 
-function projectSessionsTab(projectId, data, view) {
+function projectSessionsTab(projectId, primaryData, automaticData, view) {
   const toolbar = h("div", { className: "toolbar" },
     h("label", { className: "field field-grow" }, h("span", { text: "项目内筛选" }), h("input", { id: "project-session-query", value: view.q, placeholder: "搜索会话标题、消息或目录…", dataset: { enter: "project-session-filter", projectId } })),
     button("搜索", "project-session-filter", { kind: "primary", iconName: "search", dataset: { projectId } })
   );
   const list = h("div", { className: "list" });
-  (data.items || []).forEach((session) => list.append(...sessionEntry(session, { selectable: true })));
-  if (!(data.items || []).length) list.append(emptyState("没有匹配会话", "当前项目没有符合筛选条件的会话。", "message"));
-  return h("div", {}, toolbar, panel("项目主会话", `${formatNumber(data.total)} 个主会话`, h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "project-sessions", projectId))), automaticSessionsPanel(data), sessionBatchBar(projectId));
+  (primaryData.items || []).forEach((session) => list.append(...sessionEntry(session, { selectable: true, hideChildren: true })));
+  if (!(primaryData.items || []).length) list.append(emptyState("没有匹配主会话", "当前项目没有符合筛选条件的主会话。", "message"));
+  const automaticList = h("div", { className: "list" });
+  (automaticData.items || []).forEach((session) => automaticList.append(...sessionEntry(session, { selectable: true })));
+  if (!(automaticData.items || []).length) automaticList.append(emptyState("没有自动会话", "当前项目下没有 Job、SDK 或 Subagent 自动会话。", "activity"));
+  const automaticShown = (automaticData.items || []).length;
+  const automaticTruncated = (automaticData.total || 0) > automaticShown;
+  return h("div", {}, toolbar,
+    panel("项目主会话", `${formatNumber(primaryData.total)} 个主会话（自动会话单独列于下方，不参与主会话计数）`, h("div", {}, list, pager(primaryData.total || 0, primaryData.offset || 0, primaryData.limit || view.limit, "project-sessions", projectId))),
+    panel("自动会话", `${formatNumber(automaticData.total)} 个（Job / SDK / Subagent）${automaticTruncated ? ` · 仅显示前 ${automaticShown} 个` : ""}`, automaticList),
+    sessionBatchBar(projectId)
+  );
 }
 
 function sessionBatchBar(projectId) {
@@ -789,6 +812,8 @@ async function renderSession(token, projectId, sessionId) {
   if (token !== state.renderToken) return;
   state.pathMappings = mappings || { mappings: {} };
   const session = data.session || {};
+  const messagesSource = data.messages_source || "index";
+  const statsOnDemand = Boolean(data.stats_on_demand);
   const isPrimary = (session.session_kind || "primary") === "primary" && !session.parent_session_id;
   const recordProjectId = session.record_project_id || projectId;
   const projectPath = session.project_name || session.cwd_initial || session.cwd || projectId;
@@ -804,7 +829,8 @@ async function renderSession(token, projectId, sessionId) {
   [["", "全部"], ["user", "用户"], ["assistant", "助手"]].forEach(([role, label]) => roleButtons.append(h("button", { type: "button", className: `segmented-button${view.role === role ? " is-active" : ""}`, text: label, dataset: { action: "message-role", role, projectId, sessionId } })));
   const messages = h("div", { className: "message-list" });
   appendConversationMessages(messages, data.messages || []);
-  if (!(data.messages || []).length) messages.append(emptyState("没有匹配消息", "此角色筛选下没有可显示的消息。", "message"));
+  if (messagesSource === "unavailable") messages.append(emptyState("该自动会话消息尚未建立索引", "Subagent 日志默认不写入索引；原始 JSONL 已不存在或无法读取，暂时无法展示消息。", "message"));
+  else if (!(data.messages || []).length) messages.append(emptyState("没有匹配消息", "此角色筛选下没有可显示的消息。", "message"));
   const reader = h("section", { className: "panel" },
     h("div", { className: "reader-toolbar" }, h("div", {}, h("strong", { text: "消息阅读器" }), h("small", { text: "阅读优先 · Agent 操作默认折叠" })), roleButtons),
     messages,
@@ -813,17 +839,32 @@ async function renderSession(token, projectId, sessionId) {
   reader.dataset.sessionId = sessionId;
   const lineage = !isPrimary ? h("div", { className: "lineage-callout" },
     icon("activity"),
-    h("div", {}, h("strong", { text: sessionKindLabel(session.session_kind) }), h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : "这是自动创建的会话，目前没有足够证据确定母会话。" })),
+    h("div", {}, h("strong", { text: sessionKindLabel(session.session_kind) }), h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : "未关联父会话：该自动会话没有足够的证据确定母会话。" })),
     session.parent ? button("查看母会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: session.parent.project_id, sessionId: session.parent.id } }) : null
   ) : h("div", { hidden: true });
+  const childRows = session.children || [];
+  let childrenPanel = null;
+  if (childRows.length) {
+    const childList = h("div", { className: "list" });
+    childRows.forEach((child) => childList.append(...sessionEntry(child, { compact: true })));
+    childrenPanel = panel("子会话", `${childRows.length} 个（Job / SDK / Subagent）`, childList);
+  }
   const actions = [button("打开所在文件夹", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openSessionDirectory } })];
   if (isPrimary) actions.push(button("生成总结", "summarize-session", { kind: "secondary", iconName: "spark", dataset: { projectId: recordProjectId, sessionId } }), button("恢复会话", "open-launch", { kind: "primary", iconName: "play", dataset: { launchKey } }), button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId: recordProjectId, logicalProjectId: projectId, sessionId } }));
+  else actions.push(button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId, sessionId } }));
   pageRoot.replaceChildren(
-    pageHeading("Session", session.title || sessionId, isPrimary ? "按角色进行服务端分页，工具调用默认折叠。" : "自动会话仅供查看，默认不提供恢复和删除操作。", actions),
+    pageHeading("Session", session.title || sessionId, isPrimary ? "按角色进行服务端分页，工具调用默认折叠。" : "自动会话不提供恢复；可查看消息与 Token 统计，并可移入回收站。", actions),
     lineage,
+    childrenPanel,
     h("div", { className: "session-overview" },
-      summaryMetric("消息", formatNumber(session.total_msgs)), summaryMetric("Token（输入+输出）", formatNumber(session.total_tokens)), summaryMetric("模型", session.model || "unknown"), summaryMetric("最近活跃", session.last_active || session.created_at || "未知")
+      summaryMetric("会话类型", sessionKindLabel(session.session_kind)),
+      summaryMetric("所属项目", shortPath(session.project_name || projectPath)),
+      summaryMetric("创建时间", session.created_at || "未知"),
+      summaryMetric("消息", formatNumber(session.total_msgs)),
+      summaryMetric("Token（输入+输出）", formatNumber(session.total_tokens)),
+      summaryMetric("最近活跃", session.last_active || session.created_at || "未知")
     ),
+    statsOnDemand ? h("p", { className: "help-text", text: "Subagent 日志不写入索引：上方统计与消息均按需读取自原始 JSONL，不会修改原始文件。" }) : null,
     h("div", { className: "cwd-grid" },
       h("div", { className: "cwd-card is-initial" }, h("span", { text: "起始目录 · Initial CWD" }), h("code", { text: session.cwd_initial || session.cwd || "未知" })),
       h("div", { className: "cwd-card" }, h("span", { text: "当前目录 · Current CWD" }), h("code", { text: session.cwd || "未知" }))
@@ -1121,8 +1162,11 @@ function searchResultRow(result) {
   const isProject = result.type === "project";
   const isAutomatic = !isProject && result.session_kind && result.session_kind !== "primary";
   const title = result.title || result.session_id || result.project_id || "未命名";
+  const parentTag = !isProject
+    ? (result.parent_title ? tag(`父会话 · ${truncateText(result.parent_title, 20)}`, "warning") : (result.parent_session_id ? tag("父会话缺失", "warning") : null))
+    : null;
   const buttonNode = h("button", { className: "row-click", type: "button", dataset: isProject ? { action: "open-project", projectId: result.project_id, projectPath: result.path || result.title || "" } : { action: "open-session", projectId: result.project_id, sessionId: result.session_id } },
-    h("div", { className: "row-title-line" }, tag(isProject ? "项目" : (isAutomatic ? sessionKindLabel(result.session_kind) : "会话"), isProject || isAutomatic ? "info" : "success"), h("span", { className: "row-title", text: title }), result.parent_session_id ? tag("来自下属会话", "warning") : null),
+    h("div", { className: "row-title-line" }, tag(isProject ? "项目" : (isAutomatic ? sessionKindLabel(result.session_kind) : "会话"), isProject || isAutomatic ? "info" : "success"), h("span", { className: "row-title", text: title }), parentTag),
     highlightedSnippet(result.snippet || ""),
     rowMeta([{ icon: "folder", text: result.path || "" }, { icon: "clock", text: result.last_active || "" }])
   );
@@ -1370,7 +1414,7 @@ async function executeAction(action, target) {
     state.projects.offset = 0;
     return renderCurrentPage();
   }
-  if (action === "session-filter") { state.sessions.q = $("#session-query")?.value.trim() || ""; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "session-filter") { state.sessions.q = $("#session-query")?.value.trim() || ""; state.sessions.kind = $("#session-kind")?.value || "all"; state.sessions.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-enter") { state.projects.dirParts.push(data.name); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-depth") { state.projects.dirParts = state.projects.dirParts.slice(0, Number(data.depth)); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-clear") { state.projects.dirParts = []; state.projects.offset = 0; return renderCurrentPage(); }
@@ -1389,8 +1433,9 @@ async function executeAction(action, target) {
   }
   if (action === "clear-project-selection") { state.selectedProjects.clear(); return renderCurrentPage(); }
   if (action === "select-page-sessions") {
-    const items = state.projectData.get(data.projectId)?.sessions?.items || [];
-    items.forEach((session) => selectedSessionSet(data.projectId).add(session.id));
+    const projectData = state.projectData.get(data.projectId);
+    (projectData?.sessions?.items || []).forEach((session) => selectedSessionSet(data.projectId).add(session.id));
+    (projectData?.automatic?.items || []).forEach((session) => selectedSessionSet(data.projectId).add(session.id));
     return renderProject(++state.renderToken, data.projectId);
   }
   if (action === "clear-session-selection") { selectedSessionSet(data.projectId).clear(); return renderProject(++state.renderToken, data.projectId); }
@@ -1563,13 +1608,14 @@ async function trashProject(projectId, path) {
 }
 
 async function trashSession(projectId, sessionId, logicalProjectId = projectId) {
-  const approved = await askConfirm({ title: "将会话移到回收站", message: "只移动当前主会话 JSONL；下属会话不会被连带删除。项目工作区文件不会被修改。", detail: `会话：${sessionId}\n→ data/trash/sessions/${projectId}/`, confirmText: "移到回收站" });
+  const approved = await askConfirm({ title: "将会话移到回收站", message: "只移动该会话的 JSONL 文件；父会话、其他会话与项目工作区均不受影响。当前 UI 暂不提供回收站恢复入口。", detail: `会话：${sessionId}\n→ data/trash/sessions/`, confirmText: "移到回收站" });
   if (!approved) return;
   try {
     const result = await post("/api/v2/trash-session", { project_id: projectId, session_id: sessionId });
     state.projectData.delete(logicalProjectId);
     toast(result.message || "会话已移到回收站", "success");
-    navigate("project", { projectId: logicalProjectId, projectPath: state.projectNames.get(logicalProjectId) || "" });
+    if (state.route === "session") navigate("project", { projectId: logicalProjectId, projectPath: state.projectNames.get(logicalProjectId) || "" });
+    else await renderCurrentPage();
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -1592,7 +1638,7 @@ async function trashSelectedProjects() {
 async function trashSelectedSessions(projectId) {
   const ids = [...selectedSessionSet(projectId)];
   if (!ids.length) return;
-  const approved = await askConfirm({ title: `移动 ${ids.length} 个会话到回收站`, message: "只移动选中的主会话 JSONL，下属会话不会被连带删除。单次最多处理 500 个会话。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
+  const approved = await askConfirm({ title: `移动 ${ids.length} 个会话到回收站`, message: "只移动选中的会话 JSONL（含自动会话）；父会话不会被连带删除。单次最多处理 500 个会话。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
   if (!approved) return;
   setGlobalLoading(true, "正在批量移动会话", `处理 ${ids.length} 个会话…`);
   try {

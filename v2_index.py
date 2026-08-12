@@ -1253,7 +1253,8 @@ def list_projects(db_path, q="", drive="", sort="active", path_prefix="", limit=
         total = conn.execute("SELECT COUNT(*) AS c FROM projects" + where_sql, params).fetchone()["c"]
         rows = [_row_dict(r) for r in conn.execute(
             f"""SELECT projects.*,
-                       (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id AND (s.session_kind != 'primary' OR s.parent_session_id != '')) AS automatic_session_count
+                       (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id AND (s.session_kind != 'primary' OR s.parent_session_id != '')) AS automatic_session_count,
+                       (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id) AS all_session_count
                 FROM projects{where_sql} ORDER BY {order} LIMIT ? OFFSET ?""",
             params + [limit, offset],
         )]
@@ -1286,21 +1287,61 @@ def _attach_children(conn, rows):
     return rows
 
 
-def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0):
+def _attach_parents(conn, rows):
+    """Attach each automatic session's parent row (when known) to flat lists."""
+    for row in rows:
+        parent_session_id = row.get("parent_session_id") or ""
+        if not parent_session_id:
+            row["parent"] = None
+            continue
+        parent = conn.execute(
+            """
+            SELECT s.*, p.name AS project_name
+            FROM sessions s JOIN projects p ON p.id = s.logical_project_id
+            WHERE s.project_id = ? AND s.id = ?
+            """,
+            (row.get("parent_project_id") or row.get("record_project_id") or "", parent_session_id),
+        ).fetchone()
+        row["parent"] = _public_session(parent) if parent else None
+    return rows
+
+
+def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, kind="primary"):
+    """List sessions filtered by kind: primary (default), automatic or all.
+
+    kind values:
+      - "primary" (default): main sessions only. Automatic children are nested
+        under their parents and unattached automatic sessions are returned in
+        ``automatic_items`` — the historical behavior.
+      - "automatic": every automatic session (job / sdk / subagent) as a flat
+        list, each carrying parent info when known.
+      - "all": primary + automatic in one flat, paginated list without nesting,
+        so the same automatic session never appears twice.
+
+    Counts (``primary_total`` / ``automatic_total`` / ``automatic_all_total`` /
+    ``related_total``) always describe the full project (plus the query filter),
+    independent of the selected kind, so callers can label sections correctly.
+    """
     conn = connect(db_path)
     try:
         init_db(conn)
-        where = ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
-        params = []
+        kind = kind if kind in ("all", "primary", "automatic") else "primary"
+        base_where, base_params = [], []
         if project_id:
-            where.append("s.logical_project_id = ?")
-            params.append(project_id)
+            base_where.append("s.logical_project_id = ?")
+            base_params.append(project_id)
         if q:
-            where.append("(lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?)")
+            base_where.append("(lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?)")
             like = "%" + q.lower() + "%"
-            params.extend([like, like, like])
-        where_sql = " WHERE " + " AND ".join(where) if where else ""
-        total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + where_sql, params).fetchone()["c"]
+            base_params.extend([like, like, like])
+
+        kind_where = []
+        if kind == "primary":
+            kind_where = ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
+        elif kind == "automatic":
+            kind_where = ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
+        where_sql = " WHERE " + " AND ".join(base_where + kind_where) if (base_where or kind_where) else ""
+        total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + where_sql, base_params).fetchone()["c"]
         rows = [_public_session(r) for r in conn.execute(
             f"""
             SELECT s.*, p.name AS project_name
@@ -1310,52 +1351,70 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0):
             ORDER BY s.last_active DESC
             LIMIT ? OFFSET ?
             """,
-            params + [limit, offset],
+            base_params + [limit, offset],
         )]
-        _attach_children(conn, rows)
-        automatic_where = ["s.parent_session_id = ''", "s.session_kind != 'primary'"]
-        automatic_params = []
-        if project_id:
-            automatic_where.append("s.logical_project_id = ?")
-            automatic_params.append(project_id)
-        if q:
-            automatic_where.append("(lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?)")
-            like = "%" + q.lower() + "%"
-            automatic_params.extend([like, like, like])
-        automatic_sql = " WHERE " + " AND ".join(automatic_where)
-        automatic_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + automatic_sql, automatic_params).fetchone()["c"]
-        related_where = ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
-        related_params = []
-        if project_id:
-            related_where.append("s.logical_project_id = ?")
-            related_params.append(project_id)
-        related_total = conn.execute(
-            "SELECT COUNT(*) AS c FROM sessions s WHERE " + " AND ".join(related_where),
-            related_params,
+        if kind == "primary":
+            _attach_children(conn, rows)
+        else:
+            _attach_parents(conn, rows)
+
+        primary_where = " WHERE " + " AND ".join(
+            base_where + ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
+        )
+        primary_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + primary_where, base_params).fetchone()["c"]
+        automatic_all_where = " WHERE " + " AND ".join(
+            base_where + ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
+        )
+        automatic_all_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + automatic_all_where, base_params).fetchone()["c"]
+        automatic_unattached_where = " WHERE " + " AND ".join(
+            base_where + ["s.session_kind != 'primary'", "s.parent_session_id = ''"]
+        )
+        automatic_unattached_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM sessions s" + automatic_unattached_where, base_params
         ).fetchone()["c"]
         automatic_rows = [_public_session(r) for r in conn.execute(
             f"""
             SELECT s.*, p.name AS project_name
             FROM sessions s JOIN projects p ON p.id = s.logical_project_id
-            {automatic_sql}
+            {automatic_unattached_where}
             ORDER BY s.last_active DESC LIMIT 100
             """,
-            automatic_params,
+            base_params,
         )]
         return {
             "items": rows,
             "automatic_items": automatic_rows,
             "total": total,
-            "automatic_total": automatic_total,
-            "related_total": related_total,
+            "primary_total": primary_total,
+            "automatic_total": automatic_unattached_total,
+            "automatic_all_total": automatic_all_total,
+            "related_total": automatic_all_total,
             "limit": limit,
             "offset": offset,
+            "kind": kind,
         }
     finally:
         conn.close()
 
 
-def session_detail(db_path, project_id, session_id, limit=160, offset=0, role=""):
+def _builtin_read_jsonl(path, max_entries=None):
+    """Minimal JSONL reader used when the host app does not inject its own."""
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+                if max_entries and len(rows) >= max_entries:
+                    break
+    except OSError:
+        return []
+    return rows
+
+
+def session_detail(db_path, project_id, session_id, limit=160, offset=0, role="", read_jsonl=None, fix_text=None):
     conn = connect(db_path)
     try:
         init_db(conn)
@@ -1388,17 +1447,63 @@ def session_detail(db_path, project_id, session_id, limit=160, offset=0, role=""
             """,
             (session.get("parent_project_id") or record_project_id, session.get("parent_session_id") or ""),
         ).fetchone()) if session.get("parent_session_id") else None
-        where = "WHERE project_id = ? AND session_id = ?"
-        params = [record_project_id, session_id]
-        if role:
-            where += " AND role = ?"
-            params.append(role)
-        total = conn.execute("SELECT COUNT(*) AS c FROM messages " + where, params).fetchone()["c"]
-        rows = [_row_dict(r) for r in conn.execute(
-            f"SELECT * FROM messages {where} ORDER BY idx ASC LIMIT ? OFFSET ?",
-            params + [limit, offset],
-        )]
-        return {"session": session, "messages": rows, "total": total, "limit": limit, "offset": offset}
+        fixer = fix_text if callable(fix_text) else (lambda value: value)
+        messages_source = "index"
+        stats_on_demand = False
+        is_subagent = session.get("session_kind") == "subagent" or bool(session.get("parent_session_id"))
+        if is_subagent:
+            # Subagent logs are deliberately not indexed (see scan_incremental) to
+            # cap indexing cost. Read the original JSONL on demand for the detail
+            # view; the original file is never modified.
+            file_path = session.get("file_path") or ""
+            if file_path and os.path.isfile(file_path):
+                reader = read_jsonl if callable(read_jsonl) else _builtin_read_jsonl
+                try:
+                    entries = reader(file_path)
+                except Exception:
+                    entries = []
+                if entries:
+                    meta = _session_meta(entries, fixer)
+                    for key in (
+                        "title", "created_at", "last_active", "model", "user_msgs",
+                        "assistant_msgs", "total_msgs", "input_tokens", "output_tokens",
+                        "cache_tokens", "total_tokens", "first_user_msg",
+                    ):
+                        if key in meta:
+                            session[key] = meta[key]
+                    messages = _extract_messages(record_project_id, session_id, entries, fixer)
+                    if role:
+                        messages = [message for message in messages if message["role"] == role]
+                    total = len(messages)
+                    rows = messages[offset:offset + limit]
+                    messages_source = "jsonl"
+                    stats_on_demand = True
+                else:
+                    messages_source = "unavailable"
+                    rows, total = [], 0
+            else:
+                messages_source = "unavailable"
+                rows, total = [], 0
+        else:
+            where = "WHERE project_id = ? AND session_id = ?"
+            params = [record_project_id, session_id]
+            if role:
+                where += " AND role = ?"
+                params.append(role)
+            total = conn.execute("SELECT COUNT(*) AS c FROM messages " + where, params).fetchone()["c"]
+            rows = [_row_dict(r) for r in conn.execute(
+                f"SELECT * FROM messages {where} ORDER BY idx ASC LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            )]
+        return {
+            "session": session,
+            "messages": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "messages_source": messages_source,
+            "stats_on_demand": stats_on_demand,
+        }
     finally:
         conn.close()
 
@@ -1413,6 +1518,25 @@ def record_project_id(db_path, project_id, session_id):
             (project_id, session_id),
         ).fetchone()
         return row["project_id"] if row else project_id
+    finally:
+        conn.close()
+
+
+def session_file_path(db_path, project_id, session_id):
+    """Return (physical_jsonl_path, record_project_id) for a session row.
+
+    Looks the row up by its physical record project id; nested subagent logs
+    (<project>/<parent>/subagents/agent-*.jsonl) do not map to a top-level
+    <session>.jsonl file, so their recorded path is the only reliable one.
+    """
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        row = conn.execute(
+            "SELECT file_path, project_id FROM sessions WHERE project_id = ? AND id = ? LIMIT 1",
+            (project_id, session_id),
+        ).fetchone()
+        return (row["file_path"], row["project_id"]) if row else ("", "")
     finally:
         conn.close()
 
@@ -1443,7 +1567,10 @@ def search(db_path, q, limit=50, offset=0):
                    s.project_id AS record_project_id, s.id AS session_id, s.title,
                    s.cwd AS path, '' AS role, s.first_user_msg AS snippet, s.last_active,
                    s.session_kind, s.parent_project_id, s.parent_session_id,
-                   s.path_exists, s.grouping_reason
+                   s.path_exists, s.grouping_reason,
+                   (SELECT ps.title FROM sessions ps
+                    WHERE ps.project_id = s.parent_project_id AND ps.id = s.parent_session_id
+                   ) AS parent_title
             FROM sessions s
             WHERE lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?
             ORDER BY s.last_active DESC
@@ -1462,7 +1589,10 @@ def search(db_path, q, limit=50, offset=0):
                        f.path, f.role,
                        snippet(messages_fts, 5, '<mark>', '</mark>', '...', 12) AS snippet,
                        s.last_active, s.session_kind, s.parent_project_id, s.parent_session_id,
-                       s.path_exists, s.grouping_reason
+                       s.path_exists, s.grouping_reason,
+                       (SELECT ps.title FROM sessions ps
+                        WHERE ps.project_id = s.parent_project_id AND ps.id = s.parent_session_id
+                       ) AS parent_title
                 FROM messages_fts f
                 JOIN sessions s ON s.project_id = f.project_id AND s.id = f.session_id
                 WHERE messages_fts MATCH ?

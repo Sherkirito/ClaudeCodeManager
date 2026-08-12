@@ -179,6 +179,7 @@ kbd { padding: 2px 6px; border: 1px solid var(--line-strong); border-bottom-colo
 .list-row.is-child-session { min-height: 67px; padding-left: 28px; background: rgba(255,255,255,.008); }
 .list-row.is-child-session::before { position: absolute; top: 0; bottom: 0; left: 14px; width: 1px; background: var(--line-strong); content: ""; }
 .auto-session-note { color: var(--subtle); font-size: 10px; white-space: nowrap; }
+.auto-side { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .automatic-session-group { margin: 14px 0 0; background: rgba(112,165,235,.025); }
 .automatic-session-group > summary { padding: 14px 17px; }
 .lineage-callout { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; margin-bottom: 14px; padding: 13px 15px; border: 1px solid rgba(112,165,235,.22); border-radius: 10px; background: var(--blue-soft); }
@@ -224,7 +225,7 @@ select { cursor: pointer; }
 .batch-count span { color: var(--muted); font-size: 11px; }
 .batch-actions { display: flex; gap: 7px; }
 
-.project-summary-strip { display: grid; grid-template-columns: minmax(0,1.8fr) repeat(2,minmax(120px,.55fr)); gap: 10px; margin-bottom: 16px; }
+.project-summary-strip { display: grid; grid-template-columns: minmax(0,1.8fr) repeat(3,minmax(110px,.5fr)); gap: 10px; margin-bottom: 16px; }
 .summary-metric { min-width: 0; padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .summary-metric span { display: block; margin-bottom: 6px; color: var(--subtle); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .summary-metric strong { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
