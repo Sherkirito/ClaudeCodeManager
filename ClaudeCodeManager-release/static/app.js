@@ -132,15 +132,14 @@ const state = {
   usagePollTimer: null,
   usagePollInFlight: false,
   projects: { q: "", drive: "", sort: "active", offset: 0, limit: 50, dirParts: [], data: null, dirs: null },
-  sessions: { q: "", offset: 0, limit: 60, kind: "all" },
+  sessions: { q: "", offset: 0, limit: 60, kind: "all", teamId: "", showOrphans: false },
   teams: { q: "", offset: 0, limit: 60 },
   selectedProjects: new Set(),
   selectedSessions: new Map(),
   projectViews: new Map(),
   sessionViews: new Map(),
-  projectTabs: new Map(),
   projectData: new Map(),
-  summaryProgress: new Map(),
+  maintenanceProjects: [],
   search: { q: "", offset: 0, limit: 60 }
 };
 
@@ -301,9 +300,12 @@ const MEMBER_COLORS = {
   orange: "#f0a05c", pink: "#f28fb1", red: "#f07178", cyan: "#5cd6d0"
 };
 
+function memberHex(color) {
+  return MEMBER_COLORS[String(color || "").toLowerCase()] || "#919baa";
+}
+
 function memberDot(color) {
-  const hex = MEMBER_COLORS[String(color || "").toLowerCase()] || "#919baa";
-  return h("span", { className: "member-dot", style: `background:${hex}` });
+  return h("span", { className: "member-dot", style: `background:${memberHex(color)}` });
 }
 
 function parseTeammateEnvelopes(value) {
@@ -350,72 +352,165 @@ function registerLaunchContext(context) {
   return key;
 }
 
-function sessionKindLabel(kind) {
-  return { subagent: "Subagent", job: "后台 Job", sdk: "SDK 自动会话" }[kind] || "主会话";
+const SESSION_KIND_META = {
+  primary: { label: "主会话", tagClass: "success" },
+  job: { label: "后台任务", tagClass: "info" },
+  sdk: { label: "SDK", tagClass: "sdk" },
+  subagent: { label: "子代理", tagClass: "purple" },
+  teammate: { label: "队友", tagClass: "accent" }
+};
+const SESSION_KIND_ORDER = ["primary", "job", "sdk", "subagent", "teammate"];
+const KIND_COLORS = {
+  primary: "#5fcf9a", job: "#70a5eb", sdk: "#5cd6d0", subagent: "#b48ce9", teammate: "#f0a05c"
+};
+
+function sessionKindOf(item) {
+  const kind = String(item?.kind || item?.session_kind || "primary");
+  return SESSION_KIND_META[kind] ? kind : "primary";
 }
 
-function sessionEntry(session, { selectable = false, compact = false, hideChildren = false } = {}) {
-  const sessionId = session.id || session.session_id || "";
-  const projectId = session.project_id || "";
-  const recordProjectId = session.record_project_id || projectId;
-  const isPrimary = (session.session_kind || "primary") === "primary" && !session.parent_session_id;
-  const canSelect = selectable;
+function sessionKindLabel(kind) {
+  return SESSION_KIND_META[kind]?.label || SESSION_KIND_META.primary.label;
+}
+
+function autoKindTotal(byKind) {
+  return ["job", "sdk", "subagent", "teammate"].reduce((sum, k) => sum + Number(byKind?.[k] || 0), 0);
+}
+
+function sessionRow(item, opts = {}) {
+  const sessionId = String(item.id || item.session_id || "");
+  const kind = sessionKindOf(item);
+  const kindMeta = SESSION_KIND_META[kind];
+  const projectId = String(item.project_id || opts.projectId || "");
+  const selectable = Boolean(opts.selectable);
+  const agent = item.agent || {};
+  const descendantCount = Number(item.descendant_count ?? 0) || Number(item.child_count ?? 0) || 0;
   const row = h("div", {
-    className: `list-row${canSelect ? " has-check" : " is-clickable"}${compact ? " is-child-session" : ""}`,
-    dataset: canSelect ? undefined : { action: "open-session", projectId, sessionId },
-    title: canSelect ? undefined : "打开会话详情"
+    className: `list-row${selectable ? " has-check" : " is-clickable"}`,
+    dataset: selectable ? undefined : { action: "open-session", projectId, sessionId },
+    title: selectable ? undefined : "打开会话详情"
   });
-  if (canSelect) {
+  if (selectable) {
     row.append(h("label", { className: "check-wrap", ariaLabel: "选择会话" }, h("input", {
       type: "checkbox",
       checked: selectedSessionSet(projectId).has(sessionId),
       dataset: { change: "select-session", projectId, sessionId }
     })));
   }
-  const titleLine = h("div", { className: "row-title-line" }, h("span", { className: "row-title", text: session.title || sessionId }));
-  const isTeammate = session.task_kind === "in_process_teammate";
-  if (!isPrimary) {
-    titleLine.append(tag(sessionKindLabel(session.session_kind), session.relation_confidence === "exact" ? "success" : "info"));
-    if (isTeammate) titleLine.append(tag(`队友 · ${session.agent_type || session.agent_name || "unknown"}`, "info"));
-    if (session.team_name) titleLine.append(tag(`团队 · ${session.team_name}`, "success"));
-    if (session.parent) titleLine.append(tag(`父会话 · ${truncateText(session.parent.title || session.parent.id, 20)}`, "success"));
-    else if (session.parent_session_id) titleLine.append(tag("父会话缺失", "warning"));
-    else if (!compact) titleLine.append(tag(isTeammate ? "lead 会话未收录" : "未关联父会话", "warning"));
+  const titleLine = h("div", { className: "row-title-line" });
+  if (opts.memberDot) titleLine.append(memberDot(opts.memberDot));
+  titleLine.append(tag(kindMeta.label, kindMeta.tagClass));
+  if (kind === "teammate") {
+    const agentName = String(agent.name || item.agent_name || "");
+    const agentColor = String(agent.color || item.agent_color || "");
+    if (agentColor) titleLine.append(h("span", { className: "member-dot", style: `background:${memberHex(agentColor)}` }));
+    if (agentName) titleLine.append(h("span", { className: "agent-name", text: truncateText(agentName, 24) }));
   }
-  if (session.child_count) titleLine.append(tag(`下属 ${session.child_count}`, "info"));
-  if (session.cwd_changed) titleLine.append(tag("CWD 变化", "warning"));
-  if (session.grouping_reason === "cwd_collision") titleLine.append(tag("已纠正归类", "info"));
-  if (session.path_exists === 0) titleLine.append(tag("目录疑似已移动", "warning"));
+  titleLine.append(h("span", { className: "row-title", text: item.title || sessionId }));
+  if (opts.roleTag) titleLine.append(tag(opts.roleTag.label, opts.roleTag.tagClass));
+  const parentId = String(item.parent_session_id || "");
+  if (parentId && parentId !== sessionId) {
+    if (item.parent_title) {
+      // span (not button) because the whole row-title area sits inside the row-click button
+      titleLine.append(h("span", {
+        className: "tag tag-link",
+        role: "button",
+        tabIndex: 0,
+        title: "打开所属主会话详情",
+        dataset: { action: "open-session", projectId: String(item.parent_project_id || projectId), sessionId: parentId }
+      }, document.createTextNode(`所属主会话 · ${truncateText(item.parent_title, 18)}`)));
+    } else {
+      titleLine.append(tag("父会话缺失", "warning"));
+    }
+  }
+  const teamName = String(item.team_name || "");
+  if (teamName) {
+    const teamId = String(item.team_id || "");
+    if (teamId) {
+      titleLine.append(h("span", {
+        className: "tag tag-link",
+        role: "button",
+        tabIndex: 0,
+        title: "打开团队详情",
+        dataset: { action: "open-team", teamId }
+      }, document.createTextNode(`团队 · ${truncateText(teamName, 14)}`)));
+    } else {
+      titleLine.append(tag("团队已解散", "warning"));
+    }
+  }
+  const description = opts.descriptionNode
+    || h("p", { className: "row-description", text: stripTeammateEnvelope(item.first_user_msg) || "暂无首条消息" });
+  let metaItems = opts.metaItems;
+  if (!metaItems) {
+    metaItems = [];
+    if (opts.showProject !== false && (item.project_name || item.cwd)) metaItems.push({ icon: "folder", text: item.project_name || shortPath(item.cwd) });
+    metaItems.push({ icon: "clock", text: item.last_active || item.created_at || "时间未知" });
+  }
   const open = h("button", { className: "row-click", type: "button", dataset: { action: "open-session", projectId, sessionId } },
     titleLine,
-    h("p", { className: "row-description", text: stripTeammateEnvelope(session.first_user_msg) || session.cwd || "暂无首条消息" }),
-    rowMeta([
-      { icon: "folder", text: session.project_name || shortPath(session.cwd) },
-      { icon: "clock", text: session.last_active || session.created_at || "时间未知" }
-    ])
+    description,
+    metaItems.length ? rowMeta(metaItems) : null
   );
-  const launchKey = isPrimary ? registerLaunchContext({ kind: "session", projectId: recordProjectId, logicalProjectId: projectId, sessionId, path: session.cwd_initial || session.cwd || session.project_name || "", label: session.title || sessionId }) : "";
-  const side = h("div", { className: "row-side" },
-    h("div", { className: "metric" }, h("strong", { text: formatNumber(session.total_tokens) }), h("span", { text: "tokens" })),
-    h("div", { className: "metric" }, h("strong", { text: formatNumber(session.total_msgs) }), h("span", { text: "消息" })),
-    isPrimary
-      ? button("恢复", "open-launch", { kind: "secondary", iconName: "play", small: true, dataset: { launchKey } })
-      : h("div", { className: "auto-side" },
-          h("span", { className: "auto-session-note", text: "仅查看" }),
-          button("回收站", "trash-session", { kind: "danger", iconName: "trash", small: true, dataset: { projectId, sessionId } }))
-  );
+  const hasTokens = item.total_tokens !== undefined && item.total_tokens !== null;
+  const hasMsgs = item.total_msgs !== undefined && item.total_msgs !== null;
+  const side = h("div", { className: "row-side" });
+  if (hasTokens || hasMsgs) {
+    if (hasTokens) side.append(h("div", { className: "metric" }, h("strong", { text: formatNumber(item.total_tokens) }), h("span", { text: "tokens" })));
+    if (hasMsgs) side.append(h("div", { className: "metric" }, h("strong", { text: formatNumber(item.total_msgs) }), h("span", { text: "消息" })));
+  } else {
+    side.append(h("span", { className: "auto-session-note", text: "仅查看" }));
+  }
+  if (opts.hideTrash !== true) {
+    side.append(button("回收", "trash-session", { kind: "danger", iconName: "trash", small: true, dataset: { projectId, sessionId, descendantCount, kind } }));
+  }
   row.append(open, side);
   const nodes = [row];
-  if (session.ai_summary) nodes.push(h("details", { className: "summary-accordion" }, h("summary", { text: "查看 AI 摘要" }), h("p", { text: session.ai_summary })));
-  if (!compact && !hideChildren && (session.children || []).length) {
-    const childList = h("div", { className: "list child-session-list" });
-    session.children.forEach((child) => childList.append(...sessionEntry(child, { compact: true })));
-    nodes.push(h("details", { className: "child-session-group" },
-      h("summary", {}, h("span", { text: `下属会话 ${session.children.length} 个` }), h("small", { text: "默认折叠，不参与主会话计数" })),
-      childList
-    ));
-  }
+  if (item.ai_summary) nodes.push(h("details", { className: "summary-accordion" }, h("summary", { text: "查看 AI 摘要" }), h("p", { text: item.ai_summary })));
   return nodes;
+}
+
+function kindFacetChips(view, data, { projectId = "", showOrphans = false, orphanTotal = 0 } = {}) {
+  const byKind = data.by_kind || {};
+  const chips = h("div", { className: "facet-bar", role: "group", ariaLabel: "会话类型筛选" });
+  const entries = [
+    ["all", "全部", data.total ?? 0],
+    ...SESSION_KIND_ORDER.map((kind) => [kind, SESSION_KIND_META[kind].label, Number(byKind[kind] || 0)]),
+    ["automatic", "自动会话", autoKindTotal(byKind)]
+  ];
+  entries.forEach(([kind, label, count]) => {
+    const active = view.kind === kind;
+    chips.append(h("button", {
+      type: "button",
+      className: `chip${active ? " is-active" : ""}`,
+      ariaPressed: active,
+      dataset: { action: projectId ? "project-kind-chip" : "session-kind-chip", kind, projectId }
+    }, h("span", { text: label }), h("small", { text: formatNumber(count) })));
+  });
+  if (showOrphans) {
+    chips.append(h("button", {
+      type: "button",
+      className: `chip chip-orphan${view.showOrphans ? " is-active" : ""}`,
+      title: "history 出现过但转录缺失的会话",
+      dataset: { action: "toggle-orphans" }
+    }, h("span", { text: `失联 (${formatNumber(orphanTotal)})` })));
+  }
+  return chips;
+}
+
+function orphanListBlock(items) {
+  const list = h("div", { className: "list" });
+  (items || []).forEach((session) => list.append(h("div", { className: "list-row" },
+    h("div", {},
+      h("div", { className: "row-title-line" }, h("span", { className: "row-title", text: session.first_prompt || "历史会话" })),
+      h("p", { className: "row-description", text: `${session.project_path || "未知目录"} · ${session.substantive_count || 0}/${session.prompt_count || 0} 条有效指令 · ${session.session_id}` })
+    ),
+    h("div", { className: "auto-side" },
+      h("span", { className: "tag warning", text: "转录缺失·待找回" }),
+      button("移除记录", "orphan-remove", { kind: "ghost", iconName: "trash", small: true, dataset: { sessionId: session.session_id } })
+    )
+  )));
+  if (!(items || []).length) list.append(emptyState("没有失联会话", "当前 history 记录均能找到对应转录。", "message"));
+  return list;
 }
 
 function projectRow(project, description = null) {
@@ -466,6 +561,7 @@ function routeHash(route, params) {
   if (route === "session") return `#/session/${encode(params.projectId)}/${encode(params.sessionId)}`;
   if (route === "search") return `#/search?q=${encode(params.q || "")}`;
   if (route === "team") return `#/team/${encode(params.teamId)}`;
+  if (route === "sessions") return params.parent ? `#/sessions?parent=${encode(params.parent)}` : "#/sessions";
   return `#/${route}`;
 }
 
@@ -502,9 +598,16 @@ async function renderCurrentPage() {
 
 async function renderDashboard(token) {
   setBreadcrumbs([{ label: "工作台" }]);
-  const data = await api("/api/v2/dashboard");
+  const [data, sessionsMeta] = await Promise.all([
+    api("/api/v2/dashboard"),
+    api("/api/v2/sessions?kind=all&limit=1&offset=0")
+  ]);
   if (token !== state.renderToken) return;
   const stats = data.stats || {};
+  const byKind = sessionsMeta.by_kind || {};
+  const hasByKind = Boolean(Object.keys(byKind).length);
+  const primaryTotal = hasByKind ? Number(byKind.primary || 0) : Number(stats.total_sessions || 0);
+  const automaticTotal = hasByKind ? autoKindTotal(byKind) : Number(stats.total_automatic_sessions || 0);
   const primaryMessages = stats.total_primary_messages ?? stats.total_messages ?? 0;
   const automaticMessages = stats.total_automatic_messages ?? 0;
   const apiTokens = stats.api_tokens_30d ?? 0;
@@ -523,19 +626,43 @@ async function renderDashboard(token) {
   usagePanel.id = "dashboard-usage-panel";
   const list = h("div", { className: "list" });
   const recent = data.recent_sessions || [];
-  recent.forEach((session) => list.append(...sessionEntry(session)));
+  recent.forEach((session) => list.append(...sessionRow(session)));
   if (!recent.length) list.append(emptyState("暂无最近会话", "重建索引后，最近活动会显示在这里。", "message"));
   pageRoot.replaceChildren(
     pageHeading("Overview", "工作台", "查看本地 Claude Code 记录与近 30 天 API 用量。", [button("刷新索引", "reindex", { kind: "secondary", iconName: "refresh" })]),
     h("div", { className: "stats-grid" },
       statCard("项目", formatExactNumber(stats.total_projects), "已建立本地索引", "folder"),
-      statCard("主会话", formatExactNumber(stats.total_sessions), `自动/下属另计 ${formatExactNumber(stats.total_automatic_sessions)} 个${stats.total_teams !== undefined && stats.total_teams !== null ? ` · 团队 ${formatExactNumber(stats.total_teams)} 个` : ""}`, "message"),
+      statCard("主会话", formatExactNumber(primaryTotal), `自动/下属另计 ${formatExactNumber(automaticTotal)} 个${stats.total_teams !== undefined && stats.total_teams !== null ? ` · 团队 ${formatExactNumber(stats.total_teams)} 个` : ""}`, "message"),
       statCard("主会话记录", formatExactNumber(primaryMessages), `本地 user/assistant 记录；自动任务另计 ${formatExactNumber(automaticMessages)} 条`, "database"),
       usageCard
     ),
-    h("div", { className: "dashboard-grid" }, usagePanel, panel("最近会话", "按最后活跃时间排序", list))
+    h("div", { className: "dashboard-grid" }, usagePanel, h("div", { className: "dashboard-side" }, kindDistributionPanel(byKind), panel("最近会话", "按最后活跃时间排序", list)))
   );
   scheduleUsagePolling();
+}
+
+function kindDistributionPanel(byKind) {
+  const total = SESSION_KIND_ORDER.reduce((sum, kind) => sum + Number(byKind?.[kind] || 0), 0);
+  const bar = h("div", { className: "kind-dist" });
+  if (total > 0) {
+    SESSION_KIND_ORDER.forEach((kind) => {
+      const count = Number(byKind[kind] || 0);
+      if (count > 0) bar.append(h("div", {
+        className: "kind-segment",
+        style: `width:${(count / total) * 100}%;background:${KIND_COLORS[kind]}`,
+        title: `${SESSION_KIND_META[kind].label} ${formatExactNumber(count)}`
+      }));
+    });
+  }
+  const legend = h("div", { className: "kind-legend" });
+  SESSION_KIND_ORDER.forEach((kind) => {
+    legend.append(h("button", { type: "button", className: "kind-legend-item", title: "进入该类型的会话筛选", dataset: { action: "open-sessions-kind", kind } },
+      h("span", { className: "kind-dot", style: `background:${KIND_COLORS[kind]}` }),
+      h("span", { text: SESSION_KIND_META[kind].label }),
+      h("strong", { text: formatExactNumber(Number(byKind?.[kind] || 0)) })
+    ));
+  });
+  return panel("会话类型分布", total ? `共 ${formatExactNumber(total)} 个会话 · 点击条目进入对应筛选` : "暂无数据", h("div", { className: "kind-panel-body" }, bar, legend));
 }
 
 function renderApiUsage(rows, period, source = {}) {
@@ -674,46 +801,44 @@ function projectBatchBar() {
 }
 
 async function renderSessions(token) {
-  setBreadcrumbs([{ label: "跨项目会话" }]);
   const view = state.sessions;
-  const [data, orphanData] = await Promise.all([
-    api(`/api/v2/sessions?kind=${encode(view.kind)}&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
-    api(`/api/v2/orphan-history-sessions?q=${encode(view.q)}&limit=80`)
+  const parentId = String(state.params.parent || "");
+  const parentTitle = String(state.params.parentTitle || parentId);
+  setBreadcrumbs(parentId
+    ? [{ label: "会话", route: "sessions" }, { label: `${parentTitle} 的下属会话` }]
+    : [{ label: "会话" }]);
+  let scopeParam = "";
+  if (parentId) scopeParam = `&scope=${encode(`parent:${parentId}`)}`;
+  else if (view.teamId) scopeParam = `&scope=${encode(`team:${view.teamId}`)}`;
+  const [data, orphanData, teamsData] = await Promise.all([
+    api(`/api/v2/sessions?kind=${encode(view.kind)}&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}${scopeParam}`),
+    api(`/api/v2/orphan-history-sessions?q=${encode(view.q)}&limit=80`),
+    parentId ? Promise.resolve(null) : api("/api/v2/teams?limit=100")
   ]);
   if (token !== state.renderToken) return;
-  const kindSelect = h("select", { id: "session-kind", dataset: { change: "session-filter" } },
-    ...[["all", "全部会话"], ["primary", "主会话"], ["automatic", "自动会话"], ["teammate", "队友会话"]].map(([value, label]) => h("option", { value, text: label, selected: view.kind === value }))
-  );
   const toolbar = h("div", { className: "toolbar" },
-    h("label", { className: "field field-grow" }, h("span", { text: "会话关键词" }), h("input", { id: "session-query", value: view.q, placeholder: "搜索标题、首条消息或目录…", dataset: { enter: "session-filter" } })),
-    h("label", { className: "field" }, h("span", { text: "会话类型" }), kindSelect),
-    button("搜索", "session-filter", { kind: "primary", iconName: "search" })
+    h("label", { className: "field field-grow" }, h("span", { text: "会话关键词" }), h("input", { id: "session-query", value: view.q, placeholder: "搜索标题、首条消息或目录…", dataset: { enter: "session-filter" } }))
   );
+  if (!parentId) {
+    const teamSelect = h("select", { id: "session-team", dataset: { change: "session-team-change" } }, h("option", { value: "", text: "全部团队", selected: !view.teamId }));
+    ((teamsData && teamsData.items) || []).forEach((team) => teamSelect.append(h("option", { value: team.id, text: team.name || team.id, selected: view.teamId === team.id })));
+    toolbar.append(h("label", { className: "field" }, h("span", { text: "团队" }), teamSelect));
+  }
+  toolbar.append(button("搜索", "session-filter", { kind: "primary", iconName: "search" }));
+  const kindLabel = view.kind === "all" ? "全部" : view.kind === "automatic" ? "自动会话" : (SESSION_KIND_META[view.kind]?.label || "全部");
   const list = h("div", { className: "list" });
-  (data.items || []).forEach((session) => list.append(...sessionEntry(session)));
-  const panelMeta = {
-    all: ["全部会话", `${formatNumber(data.total)} 个会话 · 主会话 ${formatNumber(data.primary_total)} · 自动会话 ${formatNumber(data.automatic_all_total)}`],
-    primary: ["主会话列表", `${formatNumber(data.total)} 个主会话`],
-    automatic: ["自动会话", `${formatNumber(data.total)} 个自动会话（Job / SDK / Subagent）`],
-    teammate: ["队友会话", `${formatNumber(data.total)} 个队友会话（in-process teammate）`],
-  }[view.kind] || ["主会话列表", `${formatNumber(data.total)} 个主会话`];
-  const emptyText = { all: "没有匹配会话", primary: "没有匹配主会话", automatic: "没有匹配的自动会话", teammate: "没有匹配的队友会话" }[view.kind] || "没有匹配会话";
-  if (!(data.items || []).length) list.append(emptyState(emptyText, "换一个关键词，或重建索引后再试。", "message"));
-  const orphanList = h("div", { className: "list" });
-  (orphanData.items || []).forEach((session) => orphanList.append(h("div", { className: "list-row" },
-    h("div", { className: "list-main" },
-      h("div", { className: "list-title", text: session.first_prompt || "历史会话" }),
-      h("div", { className: "list-meta", text: `${session.project_path || "未知目录"} · ${session.substantive_count || 0}/${session.prompt_count || 0} 条有效指令 · ${session.session_id}` })
-    ),
-    h("span", { className: "tag warning", text: "主记录缺失·待人工处理" })
-  )));
-  if (!(orphanData.items || []).length) orphanList.append(emptyState("没有待恢复历史会话", "当前 history 记录均能找到对应主会话。", "message"));
-  pageRoot.replaceChildren(
-    pageHeading("Sessions", "跨项目会话", "服务端分页加载会话；可按类型筛选，自动会话（Job / SDK / Subagent）默认随全部会话展示。"),
+  (data.items || []).forEach((session) => list.append(...sessionRow(session)));
+  if (!(data.items || []).length) list.append(emptyState("没有匹配会话", "调整关键词、类型或团队筛选后再试。", "message"));
+  const children = [
+    pageHeading("Sessions", parentId ? `${parentTitle} 的下属会话` : "会话", parentId
+      ? "该主会话 spawn 的下属会话（子代理 / 队友 / 后台任务），统一按最近活跃排序；点击行内“所属主会话”可回到上层会话。"
+      : "所有被索引的会话都在这里——无论类型、项目、团队或是否嵌套。默认展示全部类型，可用类型 chips、团队与关键词组合筛选。"),
+    kindFacetChips(view, data, { showOrphans: !parentId, orphanTotal: orphanData.total || 0 }),
     toolbar,
-    panel(panelMeta[0], panelMeta[1], h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "sessions"))),
-    panel("待恢复历史会话", `${formatNumber(orphanData.total || 0)} 个候选；仅提示，不会自动重建或重定向`, orphanList)
-  );
+    panel("会话列表", `${formatNumber(data.total)} 个会话${view.kind !== "all" ? ` · ${kindLabel}` : ""}`, h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "sessions")))
+  ];
+  if (view.showOrphans) children.push(panel("失联会话", `${formatNumber(orphanData.total || 0)} 个候选 · 转录找回后自动归位；仅“移除记录”会使其从清单消失`, orphanListBlock(orphanData.items || [])));
+  pageRoot.replaceChildren(...children);
 }
 
 async function renderTeams(token) {
@@ -763,38 +888,28 @@ function teamRow(team) {
 }
 
 async function renderProject(token, projectId, force = false) {
-  const view = state.projectViews.get(projectId) || { q: "", offset: 0, limit: 70 };
+  const view = state.projectViews.get(projectId) || { q: "", offset: 0, limit: 70, kind: "all" };
   state.projectViews.set(projectId, view);
   let projectData = state.projectData.get(projectId);
   if (!projectData || force) {
-    const [sessions, automatic, descriptions, mappings] = await Promise.all([
-      api(`/api/v2/project/${encode(projectId)}/sessions?kind=primary&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`),
-      api(`/api/v2/project/${encode(projectId)}/sessions?kind=automatic&q=${encode(view.q)}&limit=200&offset=0`),
-      api("/api/descriptions"),
-      api("/api/v2/path-mappings")
-    ]);
-    projectData = { sessions, automatic, descriptions, mappings };
+    projectData = { sessions: await api(`/api/v2/sessions?kind=${encode(view.kind)}&scope=${encode(`project:${projectId}`)}&q=${encode(view.q)}&limit=${view.limit}&offset=${view.offset}`) };
     state.projectData.set(projectId, projectData);
-    state.pathMappings = mappings || { mappings: {} };
   }
   if (token !== state.renderToken) return;
-  const sessions = projectData.sessions || {};
-  const automatic = projectData.automatic || {};
-  const first = (sessions.items || [])[0] || {};
+  const data = projectData.sessions || {};
+  const byKind = data.by_kind || {};
+  const first = (data.items || [])[0] || {};
   const path = state.projectNames.get(projectId) || first.project_name || first.cwd_initial || first.cwd || projectId;
   state.projectNames.set(projectId, path);
   const meta = state.projectCache.get(projectId) || {};
-  const recordProjectId = meta.record_project_id || first.record_project_id || projectId;
-  const virtualProject = projectId !== recordProjectId;
   const mapping = findProjectPathMapping(path);
   const openDirectoryPath = mapping?.new_path || path;
-  const activeTab = state.projectTabs.get(projectId) || "sessions";
   setBreadcrumbs([{ label: "项目列表", route: "projects" }, { label: shortPath(path) }]);
   const oldPathMapping = findPathMapping(path);
   const launchKey = registerLaunchContext({ kind: "project", projectId, path: oldPathMapping ? mappedPath(path, oldPathMapping) : path, label: shortPath(path) });
-  const tabs = h("div", { className: "tabs", role: "tablist", ariaLabel: "项目详情页签" });
-  [["sessions", "会话列表"], ["location", "目录重定向与迁移"], ["ai", "AI 洞察与操作"], ["danger", "危险区域"]].forEach(([id, label]) => tabs.append(h("button", { type: "button", role: "tab", className: `tab-button${activeTab === id ? " is-active" : ""}`, ariaSelected: activeTab === id, text: label, dataset: { action: "project-tab", tab: id, projectId } })));
-  const content = activeTab === "sessions" ? projectSessionsTab(projectId, sessions, automatic, view) : activeTab === "location" ? projectLocationTab(projectId, path, mapping, virtualProject) : activeTab === "ai" ? projectAiTab(projectId, projectData.descriptions || {}, sessions.total || 0, virtualProject) : projectDangerTab(projectId, path, virtualProject);
+  const list = h("div", { className: "list" });
+  (data.items || []).forEach((session) => list.append(...sessionRow(session, { selectable: true })));
+  if (!(data.items || []).length) list.append(emptyState("没有匹配会话", "调整关键词或类型筛选后再试。", "message"));
   pageRoot.replaceChildren(
     pageHeading("Project", shortPath(path), path, [
       button("打开项目目录", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openDirectoryPath } }),
@@ -802,32 +917,17 @@ async function renderProject(token, projectId, force = false) {
     ]),
     h("div", { className: "project-summary-strip" },
       h("div", { className: "summary-metric path" }, h("span", { text: "项目路径" }), h("strong", { text: mapping?.new_path || path, title: mapping?.new_path || path })),
-      h("div", { className: "summary-metric" }, h("span", { text: "主会话" }), h("strong", { text: formatNumber(sessions.total || meta.session_count) })),
-      h("div", { className: "summary-metric" }, h("span", { text: "自动会话" }), h("strong", { text: formatNumber(automatic.total || 0) })),
-      h("div", { className: "summary-metric" }, h("span", { text: "全部会话" }), h("strong", { text: formatNumber((sessions.total || 0) + (automatic.total || 0)) })),
+      h("div", { className: "summary-metric" }, h("span", { text: "主会话" }), h("strong", { text: formatNumber(byKind.primary ?? meta.session_count) })),
+      h("div", { className: "summary-metric" }, h("span", { text: "自动会话" }), h("strong", { text: formatNumber(autoKindTotal(byKind)) })),
+      h("div", { className: "summary-metric" }, h("span", { text: "全部会话" }), h("strong", { text: formatNumber(data.total ?? 0) })),
       h("div", { className: "summary-metric" }, h("span", { text: "Token（输入+输出）" }), h("strong", { text: meta.total_tokens === undefined ? "—" : formatNumber(meta.total_tokens) }))
     ),
-    tabs,
-    h("div", { className: "tab-panel" }, content)
-  );
-}
-
-function projectSessionsTab(projectId, primaryData, automaticData, view) {
-  const toolbar = h("div", { className: "toolbar" },
-    h("label", { className: "field field-grow" }, h("span", { text: "项目内筛选" }), h("input", { id: "project-session-query", value: view.q, placeholder: "搜索会话标题、消息或目录…", dataset: { enter: "project-session-filter", projectId } })),
-    button("搜索", "project-session-filter", { kind: "primary", iconName: "search", dataset: { projectId } })
-  );
-  const list = h("div", { className: "list" });
-  (primaryData.items || []).forEach((session) => list.append(...sessionEntry(session, { selectable: true, hideChildren: true })));
-  if (!(primaryData.items || []).length) list.append(emptyState("没有匹配主会话", "当前项目没有符合筛选条件的主会话。", "message"));
-  const automaticList = h("div", { className: "list" });
-  (automaticData.items || []).forEach((session) => automaticList.append(...sessionEntry(session, { selectable: true })));
-  if (!(automaticData.items || []).length) automaticList.append(emptyState("没有自动会话", "当前项目下没有 Job、SDK 或 Subagent 自动会话。", "activity"));
-  const automaticShown = (automaticData.items || []).length;
-  const automaticTruncated = (automaticData.total || 0) > automaticShown;
-  return h("div", {}, toolbar,
-    panel("项目主会话", `${formatNumber(primaryData.total)} 个主会话（自动会话单独列于下方，不参与主会话计数）`, h("div", {}, list, pager(primaryData.total || 0, primaryData.offset || 0, primaryData.limit || view.limit, "project-sessions", projectId))),
-    panel("自动会话", `${formatNumber(automaticData.total)} 个（Job / SDK / Subagent）${automaticTruncated ? ` · 仅显示前 ${automaticShown} 个` : ""}`, automaticList),
+    kindFacetChips(view, data, { projectId }),
+    h("div", { className: "toolbar" },
+      h("label", { className: "field field-grow" }, h("span", { text: "项目内筛选" }), h("input", { id: "project-session-query", value: view.q, placeholder: "搜索会话标题、消息或目录…", dataset: { enter: "project-session-filter", projectId } })),
+      button("搜索", "project-session-filter", { kind: "primary", iconName: "search", dataset: { projectId } })
+    ),
+    panel("项目会话", `${formatNumber(data.total ?? 0)} 个会话 · 按最近活跃排序`, h("div", {}, list, pager(data.total || 0, data.offset || 0, data.limit || view.limit, "project-sessions", projectId))),
     sessionBatchBar(projectId)
   );
 }
@@ -844,65 +944,6 @@ function sessionBatchBar(projectId) {
   );
 }
 
-function projectLocationTab(projectId, path, mapping, virtualProject = false) {
-  const atTarget = isMappingTarget(path, mapping);
-  const mappingCard = h("article", { className: "info-card" },
-    h("h3", { text: mapping ? "当前目录重定向" : "设置目录重定向" }),
-    h("p", { text: mapping ? "打开项目会优先进入新位置；路径映射本身不会移动会话记录。" : "项目工作区移动后，可为旧路径建立一个指向新位置的映射。" }),
-    h("div", { className: "path-pair" },
-      h("div", { className: "path-item" }, h("span", { text: "旧位置" }), h("code", { text: mapping?.old_path || path })),
-      h("div", { className: "path-item" }, h("span", { text: "新位置" }), h("code", { text: mapping?.new_path || "尚未映射" }))
-    ),
-    h("div", { className: "form-actions" },
-      button(mapping ? "重新选择位置" : "选择新位置", "map-project", { kind: "secondary", iconName: "folder", dataset: { projectId, oldPath: mapping?.old_path || path } }),
-      mapping ? button("删除映射", "delete-path-map", { kind: "ghost", iconName: "x", dataset: { projectId, oldPath: mapping.old_path || path } }) : null
-    )
-  );
-  const migrateCard = h("article", { className: "info-card" },
-    h("h3", { text: atTarget ? "会话已位于重定向目录" : "迁移会话记录" }),
-    h("p", { text: virtualProject ? "该项目来自一个发生编码碰撞的物理记录目录。为避免连带修改同目录中的其他项目，只能逐会话处理，不能整目录迁移。" : (atTarget ? "当前索引项目已经对应重定向后的目录，无需再次迁移会话记录。" : "把旧项目 JSONL 迁移到新路径对应的 Claude 项目目录，并重写其中的 cwd 前缀。") }),
-    h("div", { className: "callout" }, icon("alert"), h("span", { text: "迁移会修改 JSONL 内容；原始文件会先备份到 data/migrations/。此操作不移动真实项目文件。" })),
-    h("div", { className: "form-actions" }, button(virtualProject ? "编码碰撞项目仅支持逐会话处理" : (atTarget ? "已完成重定向" : "迁移会话"), "migrate-project", { kind: "primary", iconName: atTarget ? "check" : "refresh", disabled: virtualProject || !mapping || atTarget, dataset: { projectId, oldPath: mapping?.old_path || path, newPath: mapping?.new_path || "" } }))
-  );
-  return h("div", { className: "location-grid" }, mappingCard, migrateCard);
-}
-
-function projectAiTab(projectId, descriptions, total, virtualProject = false) {
-  const description = descriptions[projectId] || {};
-  const progress = state.summaryProgress.get(projectId);
-  const progressBox = h("div", { className: "progress-box", hidden: !progress },
-    h("div", { className: "progress-track" }, h("div", { className: `progress-fill${progress?.running ? " is-running" : ""}`, style: progress && !progress.running ? `width:${progress.percent || 100}%` : "" })),
-    h("div", { className: "progress-counts" },
-      h("span", { text: `已处理：${progress?.processed || 0}/${progress?.total ?? total}` }),
-      h("span", { text: `跳过：${progress?.skipped || 0}` }),
-      h("span", { text: `失败：${progress?.failed || 0}` })
-    )
-  );
-  return h("div", { className: "ai-grid" },
-    h("article", { className: "info-card" },
-      h("h3", { text: "项目简介" }),
-      h("p", { text: "仅在主动生成时，将用于简介的内容发送至已配置的 AI Provider。" }),
-      h("div", { className: "description-content", text: description.description || "尚未生成项目简介。" }),
-      description.updated_at ? h("div", { className: "description-meta", text: `更新于 ${description.updated_at}${description.model ? ` · ${description.model}` : ""}` }) : null,
-      h("div", { className: "form-actions" }, button(virtualProject ? "逻辑项目暂不支持整项目 AI 操作" : (description.description ? "重新生成" : "生成项目简介"), "describe-project", { kind: "secondary", iconName: "spark", disabled: virtualProject, dataset: { projectId } }))
-    ),
-    h("article", { className: "info-card" },
-      h("h3", { text: "批量总结会话" }),
-      h("p", { text: `连续调用 AI，为尚无摘要的会话生成总结；已有摘要会跳过。当前项目共 ${total} 个会话，后端最多处理 500 个。` }),
-      button(progress?.running ? "正在生成…" : (virtualProject ? "逻辑项目暂不支持批量总结" : "开始批量总结"), "summarize-project", { kind: "primary", iconName: "spark", disabled: virtualProject || progress?.running, dataset: { projectId, total } }),
-      progressBox
-    )
-  );
-}
-
-function projectDangerTab(projectId, path, virtualProject = false) {
-  return h("section", { className: "danger-zone" },
-    h("h2", { text: "将项目记录移到回收站" }),
-    h("p", { text: virtualProject ? "该逻辑项目与其他项目共用 Claude 物理记录目录。整目录移动会误伤其他项目，因此已禁用；可在会话列表中逐条移到回收站。" : "此操作会移动该项目目录下的原始 JSONL 记录至 data/trash/projects/。项目工作区文件不会被删除，但当前界面暂不提供回收站恢复功能。" }),
-    button(virtualProject ? "编码碰撞项目禁止整目录移动" : "移到回收站", "trash-project", { kind: "danger", iconName: "trash", disabled: virtualProject, dataset: { projectId, projectPath: path } })
-  );
-}
-
 async function renderSession(token, projectId, sessionId) {
   const key = `${projectId}/${sessionId}`;
   const view = state.sessionViews.get(key) || { role: "", offset: 0, limit: 120 };
@@ -916,7 +957,9 @@ async function renderSession(token, projectId, sessionId) {
   const session = data.session || {};
   const messagesSource = data.messages_source || "index";
   const statsOnDemand = Boolean(data.stats_on_demand);
-  const isPrimary = (session.session_kind || "primary") === "primary" && !session.parent_session_id;
+  const kind = sessionKindOf(session);
+  const isPrimary = kind === "primary" && !session.parent_session_id;
+  const descendantCount = Number(session.descendant_count || 0);
   const recordProjectId = session.record_project_id || projectId;
   const projectPath = session.project_name || session.cwd_initial || session.cwd || projectId;
   const sessionDirectory = session.cwd || session.cwd_initial || projectPath;
@@ -939,28 +982,22 @@ async function renderSession(token, projectId, sessionId) {
     pager(data.total || 0, data.offset || 0, data.limit || view.limit, "messages", projectId)
   );
   reader.dataset.sessionId = sessionId;
-  const isTeammate = session.task_kind === "in_process_teammate";
+  const isTeammate = kind === "teammate";
   const lineage = !isPrimary ? h("div", { className: "lineage-callout" },
     icon(isTeammate ? "user" : "activity"),
     h("div", {},
       h("strong", {}, isTeammate
         ? h("span", { className: "teammate-dot-line" }, memberDot(session.agent_color), document.createTextNode(`队友 · ${session.agent_name || session.agent_id || "unknown"}`))
-        : sessionKindLabel(session.session_kind)),
+        : sessionKindLabel(kind)),
       h("p", { text: session.parent ? `归属于母会话：${session.parent.title || session.parent.id}` : (isTeammate ? "lead 会话未收录：该队友会话没有关联到 lead 主会话。" : "未关联父会话：该自动会话没有足够的证据确定母会话。") }),
       isTeammate && session.team_name ? h("p", { text: `所属团队：${session.team_name}` }) : null
     ),
     session.parent ? button("查看母会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: session.parent.project_id, sessionId: session.parent.id } }) : null
   ) : h("div", { hidden: true });
-  const childRows = session.children || [];
-  let childrenPanel = null;
-  if (childRows.length) {
-    const childList = h("div", { className: "list" });
-    childRows.forEach((child) => childList.append(...sessionEntry(child, { compact: true })));
-    childrenPanel = panel("子会话", `${childRows.length} 个（Job / SDK / Subagent）`, childList);
-  }
   const actions = [button("打开所在文件夹", "open-project-directory", { kind: "secondary", iconName: "folder", dataset: { projectPath: openSessionDirectory } })];
-  if (isPrimary) actions.push(button("生成总结", "summarize-session", { kind: "secondary", iconName: "spark", dataset: { projectId: recordProjectId, sessionId } }), button("恢复会话", "open-launch", { kind: "primary", iconName: "play", dataset: { launchKey } }), button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId: recordProjectId, logicalProjectId: projectId, sessionId } }));
-  else actions.push(button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId, sessionId } }));
+  if (descendantCount > 0) actions.push(button(`查看下属会话 (${descendantCount})`, "open-children", { kind: "secondary", iconName: "message", dataset: { sessionId, parentTitle: session.title || sessionId } }));
+  if (isPrimary) actions.push(button("生成总结", "summarize-session", { kind: "secondary", iconName: "spark", dataset: { projectId: recordProjectId, sessionId } }), button("恢复会话", "open-launch", { kind: "primary", iconName: "play", dataset: { launchKey } }), button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId: recordProjectId, logicalProjectId: projectId, sessionId, descendantCount, kind } }));
+  else actions.push(button("移到回收站", "trash-session", { kind: "danger", iconName: "trash", dataset: { projectId, sessionId, descendantCount, kind } }));
   const teammateInfo = isTeammate && session.agent_description
     ? h("div", { className: "info-card teammate-info" }, h("h3", { text: "队友任务" }), h("p", { text: session.agent_description }))
     : null;
@@ -968,9 +1005,8 @@ async function renderSession(token, projectId, sessionId) {
     pageHeading("Session", session.title || sessionId, isPrimary ? "按角色进行服务端分页，工具调用默认折叠。" : "自动会话不提供恢复；可查看消息与 Token 统计，并可移入回收站。", actions),
     lineage,
     teammateInfo,
-    childrenPanel,
     h("div", { className: "session-overview" },
-      summaryMetric("会话类型", sessionKindLabel(session.session_kind)),
+      summaryMetric("会话类型", sessionKindLabel(kind)),
       summaryMetric("所属项目", shortPath(session.project_name || projectPath)),
       summaryMetric("创建时间", session.created_at || "未知"),
       summaryMetric("消息", formatNumber(session.total_msgs)),
@@ -982,14 +1018,17 @@ async function renderSession(token, projectId, sessionId) {
       h("div", { className: "cwd-card is-initial" }, h("span", { text: "起始目录 · Initial CWD" }), h("code", { text: session.cwd_initial || session.cwd || "未知" })),
       h("div", { className: "cwd-card" }, h("span", { text: "当前目录 · Current CWD" }), h("code", { text: session.cwd || "未知" }))
     ),
-    session.path_exists === 0 && !findPathMapping(session.cwd_initial || session.cwd || projectPath) ? h("div", { className: "lineage-callout" }, icon("alert"), h("div", {}, h("strong", { text: "原目录不存在，可能已经移动" }), h("p", { text: "管理器不会自动选择目标位置。请回到项目的“目录重定向与迁移”页签，由你确认新的目录。" }))) : null,
+    session.path_exists === 0 && !findPathMapping(session.cwd_initial || session.cwd || projectPath) ? h("div", { className: "lineage-callout" }, icon("alert"), h("div", {}, h("strong", { text: "原目录不存在，可能已经移动" }), h("p", { text: "管理器不会自动选择目标位置。请前往系统设置 → 数据维护，由你确认新的目录。" }))) : null,
     h("div", { className: "session-summary-card" }, h("span", { text: "AI 会话总结" }), h("p", { text: session.ai_summary || "尚未生成会话总结。" })),
     reader
   );
 }
 
 async function renderTeam(token, teamId) {
-  const data = await api(`/api/v2/team/${encode(teamId)}`);
+  const [data, sessionsData] = await Promise.all([
+    api(`/api/v2/team/${encode(teamId)}`),
+    api(`/api/v2/sessions?kind=all&scope=${encode(`team:${teamId}`)}&limit=100&offset=0`)
+  ]);
   if (token !== state.renderToken) return;
   const team = data.team || {};
   const lead = data.lead || null;
@@ -1003,49 +1042,53 @@ async function renderTeam(token, teamId) {
     ),
     lead.session ? button("查看 lead 会话", "open-session", { kind: "secondary", small: true, dataset: { projectId: lead.session.project_id, sessionId: lead.session.id } }) : null
   ) : null;
+  const teamSessions = (sessionsData && sessionsData.items) || [];
+  const sessionList = h("div", { className: "list" });
+  teamSessions.forEach((session) => sessionList.append(...sessionRow(session)));
+  if (!teamSessions.length) sessionList.append(emptyState("暂无团队会话", "该团队尚未收录任何会话。", "message"));
+  const sessionTruncated = (sessionsData?.total || 0) > teamSessions.length;
   const memberList = h("div", { className: "list" });
-  members.forEach((member) => memberList.append(memberRow(member)));
+  members.forEach((member) => memberList.append(...memberRow(member)));
   if (!members.length) memberList.append(emptyState("暂无团队成员", "该团队尚未收录任何队友会话。", "user"));
   pageRoot.replaceChildren(
     pageHeading("Team", team.name || teamId, team.cwd || ""),
     h("div", { className: "project-summary-strip" },
       summaryMetric("成员", formatNumber(team.member_count ?? members.length)),
-      summaryMetric("会话", formatNumber(team.session_count)),
+      summaryMetric("会话", formatNumber(sessionsData?.total ?? team.session_count)),
       summaryMetric("消息", formatNumber(team.total_msgs)),
       summaryMetric("Token", formatNumber(team.total_tokens))
     ),
     team.config_error ? h("div", { className: "inline-alert alert-warning" }, icon("alert"), h("div", {}, h("strong", { text: "团队配置损坏" }), h("p", { text: String(team.config_error) }))) : null,
     leadCallout,
+    panel("团队会话", `${formatNumber(sessionsData?.total || 0)} 个（scope=team）${sessionTruncated ? ` · 仅显示前 ${teamSessions.length} 个` : ""}`, sessionList),
     panel("成员", `${members.length} 个`, memberList)
   );
 }
 
 function memberRow(member) {
   const session = member.session || null;
-  const confidence = member.confidence || "";
-  const confidenceTag = (confidence === "exact" || confidence === "lead_dir")
-    ? tag("精确关联", "success")
-    : confidence === "meta_scope" ? tag("前缀匹配", "info") : tag("仅团队级", "warning");
-  const titleLine = h("div", { className: "row-title-line" },
-    memberDot(member.color),
-    h("span", { className: "row-title", text: member.name || member.agent_id || "未命名成员" }),
-    tag(member.agent_type || member.name || "teammate", "info"),
-    confidenceTag
-  );
-  const sessionProjectId = session ? (member.logical_project_id || session.project_id) : "";
-  const description = session
-    ? `${session.title || session.id} · ${formatNumber(session.total_msgs)} 条消息 · 最近活跃 ${session.last_active || session.created_at || "未知"}`
-    : "该成员尚无日志记录";
-  const main = session
-    ? h("button", { className: "row-click", type: "button", dataset: { action: "open-session", projectId: sessionProjectId, sessionId: session.id } }, titleLine, h("p", { className: "row-description", text: description }), rowMeta([{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }]))
-    : h("div", {}, titleLine, h("p", { className: "row-description", text: description }), rowMeta([{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }]));
-  const row = h("div", {
-    className: `list-row${session ? " is-clickable" : ""}`,
-    dataset: session ? { action: "open-session", projectId: sessionProjectId, sessionId: session.id } : undefined,
-    title: session ? "打开会话详情" : undefined
-  }, main);
-  if (session) row.append(h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight")));
-  return row;
+  const role = member.role === "lead"
+    ? { label: "lead", tagClass: "success" }
+    : { label: "成员", tagClass: "info" };
+  if (session) {
+    return sessionRow(session, {
+      memberDot: member.color,
+      roleTag: role,
+      metaItems: [{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }]
+    });
+  }
+  return [h("div", { className: "list-row" },
+    h("div", {},
+      h("div", { className: "row-title-line" },
+        memberDot(member.color),
+        h("span", { className: "row-title", text: member.name || member.agent_id || "未命名成员" }),
+        tag(member.agent_type || "teammate", "info"),
+        tag(role.label, role.tagClass)
+      ),
+      h("p", { className: "row-description", text: "该成员尚无日志记录" }),
+      rowMeta([{ icon: "clock", text: `加入于 ${member.joined_at || "未知"}` }])
+    )
+  )];
 }
 
 function summaryMetric(label, value) { return h("div", { className: "summary-metric" }, h("span", { text: label }), h("strong", { text: value })); }
@@ -1357,22 +1400,19 @@ async function renderSearch(token, query) {
 }
 
 function searchResultRow(result) {
-  const isProject = result.type === "project";
-  const isAutomatic = !isProject && result.session_kind && result.session_kind !== "primary";
-  const title = result.title || result.session_id || result.project_id || "未命名";
-  const parentTag = !isProject
-    ? (result.parent_title ? tag(`父会话 · ${truncateText(result.parent_title, 20)}`, "warning") : (result.parent_session_id ? tag("父会话缺失", "warning") : null))
-    : null;
-  const buttonNode = h("button", { className: "row-click", type: "button", dataset: isProject ? { action: "open-project", projectId: result.project_id, projectPath: result.path || result.title || "" } : { action: "open-session", projectId: result.project_id, sessionId: result.session_id } },
-    h("div", { className: "row-title-line" }, tag(isProject ? "项目" : (isAutomatic ? sessionKindLabel(result.session_kind) : "会话"), isProject || isAutomatic ? "info" : "success"), h("span", { className: "row-title", text: title }), parentTag),
-    highlightedSnippet(result.snippet || ""),
-    rowMeta([{ icon: "folder", text: result.path || "" }, { icon: "clock", text: result.last_active || "" }])
-  );
-  return h("div", { className: "list-row search-result" }, buttonNode, h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight")));
+  if (result.type === "project") {
+    const buttonNode = h("button", { className: "row-click", type: "button", dataset: { action: "open-project", projectId: result.project_id, projectPath: result.path || result.title || "" } },
+      h("div", { className: "row-title-line" }, tag("项目", "info"), h("span", { className: "row-title", text: result.title || result.project_id || "未命名" })),
+      highlightedSnippet(result.snippet || ""),
+      rowMeta([{ icon: "folder", text: result.path || "" }, { icon: "clock", text: result.last_active || "" }])
+    );
+    return h("div", { className: "list-row search-result" }, buttonNode, h("span", { className: "icon-button", ariaHidden: "true" }, icon("chevronRight")));
+  }
+  return sessionRow(result, { descriptionNode: highlightedSnippet(result.snippet || "") });
 }
 
 function highlightedSnippet(value) {
-  const paragraph = h("p", { className: "row-description" });
+  const paragraph = h("p", { className: "row-description snippet" });
   const parts = String(value).split(/(<mark>|<\/mark>)/i);
   let marked = false;
   parts.forEach((part) => {
@@ -1386,17 +1426,47 @@ function highlightedSnippet(value) {
 
 async function renderSettings(token) {
   setBreadcrumbs([{ label: "系统设置" }]);
-  const [config, mappings] = await Promise.all([api("/api/config"), api("/api/v2/path-mappings")]);
+  const [config, mappings, orphans, projectsData] = await Promise.all([
+    api("/api/config"),
+    api("/api/v2/path-mappings"),
+    api("/api/v2/orphan-history-sessions?limit=100"),
+    api("/api/v2/projects?limit=500")
+  ]);
   if (token !== state.renderToken) return;
   state.config = config;
   state.pathMappings = mappings || { mappings: {} };
+  state.maintenanceProjects = projectsData.items || [];
   const prefs = loadLaunchPreferences(config);
   const aiSection = settingsSection("AI 服务配置", "Provider、Endpoint、模型与密钥。旧密钥绝不回显。", "spark", aiConfigForm(config));
   const launchSection = settingsSection("启动与偏好", "默认工作区与统一权限模式保存在本机。", "terminal", launchPreferencesForm(prefs));
-  const maintenance = settingsSection("数据索引维护", "维护 SQLite / FTS5 索引及批量 AI 能力。", "database", h("div", { className: "form-stack" },
-    h("p", { className: "help-text", text: "“刷新索引”只解析新增或变化的记录，适合日常使用；“完整重建”会重新解析全部 JSONL，仅用于索引损坏或升级后的深度维护。" }),
-    h("div", { className: "form-actions" }, button("刷新索引", "reindex", { kind: "secondary", iconName: "refresh" }), button("完整重建", "reindex-full", { kind: "ghost", iconName: "database" }), button("为所有项目生成简介", "describe-all", { kind: "secondary", iconName: "spark" }))
-  ));
+  const maintenance = settingsSection("数据维护", "路径映射、JSONL 迁移、索引重建、失联记录管理与 AI 批量任务。", "database", h("div", { className: "maintenance-grid" },
+    maintenanceCard("索引重建", "“刷新索引”只解析新增或变化的记录，适合日常使用；“完整重建”重新解析全部 JSONL，仅用于索引损坏或升级后的深度维护。", h("div", { className: "form-actions" },
+      button("刷新索引（增量）", "reindex", { kind: "secondary", iconName: "refresh" }),
+      button("完整重建", "reindex-full", { kind: "ghost", iconName: "database" })
+    )),
+    maintenanceCard("路径映射", "旧路径 → 新位置的映射。项目启动时优先使用新位置；映射本身不会移动会话记录。", h("div", { className: "form-stack" },
+      pathMappingList(state.pathMappings),
+      projectPicker("maint-project-map", state.maintenanceProjects),
+      h("div", { className: "form-actions" }, button("为选定项目选择新位置", "maint-map-project", { kind: "secondary", iconName: "folder", dataset: { picker: "maint-project-map" } }))
+    )),
+    maintenanceCard("JSONL 迁移", "把旧项目会话 JSONL 迁移到新路径对应的 Claude 项目目录，并重写其中 cwd 前缀；原始文件会先备份到 data/migrations/。", h("div", { className: "form-stack" },
+      projectPicker("maint-project-migrate", state.maintenanceProjects),
+      h("div", { className: "form-actions" }, button("选择新位置并迁移", "maint-migrate-project", { kind: "primary", iconName: "refresh", dataset: { picker: "maint-project-migrate" } }))
+    )),
+    maintenanceCard("失联记录", "history 出现过但转录缺失的会话。转录被索引找回后会自动归位；仅“移除记录”会使其从清单消失。", orphanListBlock(orphans.items || [])),
+    maintenanceCard("AI 批量任务", "为所有项目生成简介；或为选定项目批量生成会话总结。均会连续调用已配置的 AI 服务，可能产生费用。", h("div", { className: "form-stack" },
+      projectPicker("maint-project-ai", state.maintenanceProjects),
+      h("div", { className: "form-actions" },
+        button("为选定项目生成简介", "maint-describe-project", { kind: "secondary", iconName: "spark", dataset: { picker: "maint-project-ai" } }),
+        button("批量总结选定项目会话", "maint-summarize-project", { kind: "secondary", iconName: "spark", dataset: { picker: "maint-project-ai" } })
+      ),
+      h("div", { className: "form-actions" }, button("为所有项目生成简介", "describe-all", { kind: "ghost", iconName: "spark" }))
+    )),
+    maintenanceCard("危险操作", "将选定项目的原始 Claude JSONL 记录移到回收站；项目工作区文件不会被删除，当前 UI 暂不提供回收站恢复入口。", h("div", { className: "form-stack" },
+      projectPicker("maint-project-danger", state.maintenanceProjects),
+      h("div", { className: "form-actions" }, button("将项目记录移到回收站", "maint-trash-project", { kind: "danger", iconName: "trash", dataset: { picker: "maint-project-danger" } }))
+    ))
+  ), "span-2");
   const recordSource = settingsSection("会话记录来源", config.projects_dir_available ? "已自动发现 Claude Code 会话目录。" : "当前目录尚无 projects 子目录；启动 Claude Code 产生会话后可刷新索引。", "database", h("div", { className: "form-stack" },
     h("div", { className: "path-pair" },
       h("div", { className: "path-item" }, h("span", { text: "Claude 配置目录" }), h("code", { text: config.claude_dir || "未知" })),
@@ -1404,19 +1474,32 @@ async function renderSettings(token) {
     ),
     h("p", { className: "help-text", text: `来源：${config.claude_dir_source || "user_home"}。优先支持 --claude-dir、CCM_CLAUDE_DIR 与 Claude Code 官方 CLAUDE_CONFIG_DIR；未配置时自动使用当前用户主目录。` })
   ), "span-2");
-  const redirects = directoryRedirectSettings(state.pathMappings);
   const appSection = settingsSection("应用与高级操作", "关闭本地 HTTP 服务的最终安全出口。", "settings", h("div", { className: "form-stack" },
     h("p", { className: "help-text", text: "关闭管理器不会删除任何项目、会话或索引数据。" }),
     h("div", { className: "form-actions" }, button("关闭管理器", "settings-shutdown", { kind: "danger", iconName: "x" }))
   ), "danger-section");
-  pageRoot.replaceChildren(pageHeading("Preferences", "系统设置", "集中管理 AI 服务、启动偏好、记录来源、目录重定向、索引维护与应用操作。"), h("div", { className: "settings-grid" }, aiSection, launchSection, recordSource, redirects, maintenance, appSection));
+  pageRoot.replaceChildren(pageHeading("Preferences", "系统设置", "集中管理 AI 服务、启动偏好、记录来源、数据维护与应用操作。"), h("div", { className: "settings-grid" }, aiSection, launchSection, recordSource, maintenance, appSection));
 }
 
-function directoryRedirectSettings(mappings) {
+function maintenanceCard(title, description, content) {
+  return h("article", { className: "info-card maintenance-card" },
+    h("h3", { text: title }),
+    h("p", { text: description }),
+    content
+  );
+}
+
+function projectPicker(id, projects) {
+  const select = h("select", { id }, h("option", { value: "", text: "选择项目…" }));
+  (projects || []).forEach((project) => select.append(h("option", { value: project.id, text: `${shortPath(project.cwd || project.name || project.id)}` })));
+  return h("label", { className: "field" }, h("span", { text: "项目" }), select);
+}
+
+function pathMappingList(mappings) {
   const entries = Object.values(mappings?.mappings || {});
   const content = h("div", { className: "mapping-list" });
   if (!entries.length) {
-    content.append(emptyState("暂无目录重定向", "在项目详情的“目录重定向与迁移”页签中可以新增映射。", "folder"));
+    content.append(h("p", { className: "help-text", text: "暂无映射。选择项目后可为旧路径建立指向新位置的映射。" }));
   } else {
     entries.forEach((mapping) => content.append(h("div", { className: "mapping-row" },
       h("div", { className: "mapping-path" }, h("span", { text: "原目录" }), h("code", { text: mapping.old_path || "", title: mapping.old_path || "" })),
@@ -1425,7 +1508,7 @@ function directoryRedirectSettings(mappings) {
       button("删除", "delete-global-path-map", { kind: "ghost", iconName: "x", small: true, dataset: { oldPath: mapping.old_path || "" } })
     )));
   }
-  return settingsSection("目录重定向", `当前共有 ${entries.length} 条映射。项目启动时会优先使用重定向后的目录。`, "folder", content, "span-2");
+  return content;
 }
 
 function settingsSection(title, description, iconName, content, extraClass = "") {
@@ -1547,19 +1630,31 @@ async function pickFolder() {
   return result.path;
 }
 
-function askConfirm({ title, message, detail = "", confirmText = "确认", tone = "danger", eyebrow = "安全确认" }) {
+function askConfirm({ title, message, detail = "", confirmText = "确认", tone = "danger", eyebrow = "安全确认", checkbox = null }) {
   $("#confirm-title").textContent = title;
   $("#confirm-message").textContent = message;
   $("#confirm-eyebrow").textContent = eyebrow;
   const detailNode = $("#confirm-detail");
   detailNode.textContent = detail;
   detailNode.hidden = !detail;
+  const checkboxRow = $("#confirm-checkbox");
+  const checkboxInput = $("#confirm-checkbox-input");
+  if (checkbox) {
+    checkboxRow.hidden = false;
+    checkboxInput.checked = checkbox.checked !== false;
+    $("#confirm-checkbox-label").textContent = checkbox.label;
+  } else {
+    checkboxRow.hidden = true;
+  }
   const submit = $("#confirm-submit");
   submit.textContent = confirmText;
   submit.className = `button button-${tone}`;
   confirmDialog.showModal();
   return new Promise((resolve) => {
-    const onClose = () => { confirmDialog.removeEventListener("close", onClose); resolve(confirmDialog.returnValue === "confirm"); };
+    const onClose = () => {
+      confirmDialog.removeEventListener("close", onClose);
+      resolve({ confirmed: confirmDialog.returnValue === "confirm", checkbox: Boolean(checkboxInput.checked) });
+    };
     confirmDialog.addEventListener("close", onClose);
   });
 }
@@ -1594,10 +1689,8 @@ async function executeAction(action, target) {
     return;
   }
   if (action === "go-to-migration") {
-    const context = state.launchContext;
     launchDialog.close();
-    state.projectTabs.set(context.projectId, "location");
-    return navigate("project", { projectId: context.projectId, projectPath: state.projectNames.get(context.projectId) || context.path });
+    return navigate("settings");
   }
   if (action === "breadcrumb") return navigate(data.route, data.route === "project" ? { projectId: data.projectId, projectPath: data.projectPath } : {});
   if (action === "open-project") return navigate("project", { projectId: data.projectId, projectPath: data.projectPath });
@@ -1612,13 +1705,26 @@ async function executeAction(action, target) {
     state.projects.offset = 0;
     return renderCurrentPage();
   }
-  if (action === "session-filter") { state.sessions.q = $("#session-query")?.value.trim() || ""; state.sessions.kind = $("#session-kind")?.value || "all"; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "session-filter") { state.sessions.q = $("#session-query")?.value.trim() || ""; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "session-kind-chip") { state.sessions.kind = data.kind; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "session-team-change") { state.sessions.teamId = $("#session-team")?.value || ""; state.sessions.offset = 0; return renderCurrentPage(); }
+  if (action === "toggle-orphans") { state.sessions.showOrphans = !state.sessions.showOrphans; return renderCurrentPage(); }
+  if (action === "orphan-remove") return removeOrphanRecord(data.sessionId);
+  if (action === "open-children") { state.sessions.offset = 0; return navigate("sessions", { parent: data.sessionId, parentTitle: data.parentTitle || data.sessionId }); }
+  if (action === "open-sessions-kind") { state.sessions.kind = data.kind; state.sessions.offset = 0; return navigate("sessions"); }
+  if (action === "project-kind-chip") {
+    const view = state.projectViews.get(data.projectId) || { q: "", offset: 0, limit: 70, kind: "all" };
+    view.kind = data.kind;
+    view.offset = 0;
+    state.projectViews.set(data.projectId, view);
+    state.projectData.delete(data.projectId);
+    return renderProject(++state.renderToken, data.projectId, true);
+  }
   if (action === "team-filter") { state.teams.q = $("#team-query")?.value.trim() || ""; state.teams.offset = 0; return renderCurrentPage(); }
   if (action === "open-team") return navigate("team", { teamId: data.teamId });
   if (action === "project-dir-enter") { state.projects.dirParts.push(data.name); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-depth") { state.projects.dirParts = state.projects.dirParts.slice(0, Number(data.depth)); state.projects.offset = 0; return renderCurrentPage(); }
   if (action === "project-dir-clear") { state.projects.dirParts = []; state.projects.offset = 0; return renderCurrentPage(); }
-  if (action === "project-tab") { state.projectTabs.set(data.projectId, data.tab); return renderProject(++state.renderToken, data.projectId); }
   if (action === "project-session-filter") {
     const view = state.projectViews.get(data.projectId);
     view.q = $("#project-session-query")?.value.trim() || "";
@@ -1635,28 +1741,17 @@ async function executeAction(action, target) {
   if (action === "select-page-sessions") {
     const projectData = state.projectData.get(data.projectId);
     (projectData?.sessions?.items || []).forEach((session) => selectedSessionSet(data.projectId).add(session.id));
-    (projectData?.automatic?.items || []).forEach((session) => selectedSessionSet(data.projectId).add(session.id));
     return renderProject(++state.renderToken, data.projectId);
   }
   if (action === "clear-session-selection") { selectedSessionSet(data.projectId).clear(); return renderProject(++state.renderToken, data.projectId); }
   if (action === "trash-selected-projects") return trashSelectedProjects();
   if (action === "trash-selected-sessions") return trashSelectedSessions(data.projectId);
-  if (action === "map-project") {
-    try {
-      const path = await pickFolder();
-      const result = await post("/api/v2/path-map", { old_path: data.oldPath, new_path: path });
-      state.projectData.delete(data.projectId);
-      toast(result.message || "路径映射已保存", "success");
-      return renderProject(++state.renderToken, data.projectId, true);
-    } catch (error) { toast(error.message, "error"); }
-    return;
-  }
-  if (action === "delete-path-map") return deletePathMap(data.projectId, data.oldPath);
   if (action === "delete-global-path-map") return deleteGlobalPathMap(data.oldPath);
-  if (action === "migrate-project") return migrateProject(data.projectId, data.oldPath, data.newPath);
-  if (action === "describe-project") return describeProject(data.projectId);
-  if (action === "summarize-project") return summarizeProject(data.projectId, Number(data.total || 0));
-  if (action === "trash-project") return trashProject(data.projectId, data.projectPath);
+  if (action === "maint-map-project") return maintenanceMapProject(data.picker);
+  if (action === "maint-migrate-project") return maintenanceMigrateProject(data.picker);
+  if (action === "maint-describe-project") return maintenanceDescribeProject(data.picker);
+  if (action === "maint-summarize-project") return maintenanceSummarizeProject(data.picker);
+  if (action === "maint-trash-project") return maintenanceTrashProject(data.picker);
   if (action === "message-role") {
     const view = state.sessionViews.get(`${data.projectId}/${data.sessionId}`);
     view.role = data.role;
@@ -1664,7 +1759,7 @@ async function executeAction(action, target) {
     return renderCurrentPage();
   }
   if (action === "summarize-session") return summarizeSession(data.projectId, data.sessionId);
-  if (action === "trash-session") return trashSession(data.projectId, data.sessionId, data.logicalProjectId || data.projectId);
+  if (action === "trash-session") return trashSession(data.projectId, data.sessionId, data.logicalProjectId || data.projectId, { descendantCount: Number(data.descendantCount || 0), kind: data.kind || "" });
   if (action === "save-ai-config") return saveAiConfig();
   if (action === "pick-preference-folder") {
     try { $("#preference-path").value = await pickFolder(); } catch (error) { toast(error.message, "error"); }
@@ -1677,7 +1772,8 @@ async function executeAction(action, target) {
   }
   if (action === "describe-all") return describeAll();
   if (action === "settings-shutdown") {
-    if (await askConfirm({ title: "关闭管理器", message: "确认停止本地 HTTP 服务？当前页面随后将不可用。", confirmText: "关闭管理器" })) await shutdownManager();
+    const shutdownConfirm = await askConfirm({ title: "关闭管理器", message: "确认停止本地 HTTP 服务？当前页面随后将不可用。", confirmText: "关闭管理器" });
+    if (shutdownConfirm.confirmed) await shutdownManager();
     return;
   }
   if (action === "cancel-shutdown") { $("#shutdown-popover").hidden = true; $("#shutdown-menu-button").setAttribute("aria-expanded", "false"); return; }
@@ -1707,84 +1803,133 @@ async function openProjectDirectory(path) {
   }
 }
 
-async function deletePathMap(projectId, oldPath) {
-  const approved = await askConfirm({ title: "删除路径映射", message: "删除后，“打开项目”将不再自动进入新位置。此操作不会移动或删除任何 JSONL 文件。", detail: oldPath, confirmText: "删除映射", tone: "danger" });
-  if (!approved) return;
-  try {
-    const result = await post("/api/v2/path-map-delete", { old_path: oldPath });
-    state.projectData.delete(projectId);
-    toast(result.message || "路径映射已删除", "success");
-    await renderProject(++state.renderToken, projectId, true);
-  } catch (error) { toast(error.message, "error"); }
-}
-
 async function deleteGlobalPathMap(oldPath) {
-  const approved = await askConfirm({ title: "删除目录重定向", message: "删除后，项目启动将不再自动进入重定向后的目录。此操作不会移动或删除任何 JSONL 文件。", detail: oldPath, confirmText: "删除重定向", tone: "danger" });
-  if (!approved) return;
+  const result = await askConfirm({ title: "删除目录重定向", message: "删除后，项目启动将不再自动进入重定向后的目录。此操作不会移动或删除任何 JSONL 文件。", detail: oldPath, confirmText: "删除重定向", tone: "danger" });
+  if (!result.confirmed) return;
   try {
-    const result = await post("/api/v2/path-map-delete", { old_path: oldPath });
+    const deleted = await post("/api/v2/path-map-delete", { old_path: oldPath });
     state.pathMappings = await api("/api/v2/path-mappings");
     state.projectData.clear();
-    toast(result.message || "目录重定向已删除", "success");
+    toast(deleted.message || "目录重定向已删除", "success");
     await renderSettings(++state.renderToken);
   } catch (error) { toast(error.message, "error"); }
 }
 
-async function migrateProject(projectId, oldPath, newPath) {
-  const approved = await askConfirm({
+async function removeOrphanRecord(sessionId) {
+  const result = await askConfirm({
+    eyebrow: "失联记录",
+    title: "移除失联记录",
+    message: "该 history 记录将从失联清单中删除。若转录日后被索引找回，会重新收录为会话。",
+    detail: `会话：${sessionId}`,
+    confirmText: "移除记录"
+  });
+  if (!result.confirmed) return;
+  try {
+    const removed = await post("/api/v2/orphan-history-sessions/remove", { session_id: sessionId });
+    toast(removed.message || "失联记录已移除", "success");
+    await renderCurrentPage();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function maintenanceProject(pickerId) {
+  const id = $(`#${pickerId}`)?.value || "";
+  const project = (state.maintenanceProjects || []).find((item) => item.id === id);
+  if (!project) {
+    toast("请先在“数据维护”中选择一个项目", "error");
+    throw new Error("no project selected");
+  }
+  return project;
+}
+
+async function maintenanceMapProject(pickerId) {
+  let project;
+  try { project = await maintenanceProject(pickerId); } catch (error) { return; }
+  try {
+    const path = await pickFolder();
+    const result = await post("/api/v2/path-map", { old_path: project.cwd || project.name, new_path: path });
+    state.pathMappings = await api("/api/v2/path-mappings");
+    state.projectData.clear();
+    toast(result.message || "路径映射已保存", "success");
+    await renderSettings(++state.renderToken);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function maintenanceMigrateProject(pickerId) {
+  let project;
+  try { project = await maintenanceProject(pickerId); } catch (error) { return; }
+  let newPath;
+  try { newPath = await pickFolder(); } catch (error) { toast(error.message, "error"); return; }
+  const result = await askConfirm({
     eyebrow: "中风险维护",
     title: "迁移项目会话",
     message: "此操作将迁移 Claude 会话记录，并重写 JSONL 顶层 cwd 的旧路径前缀。真实项目工作区不会被移动。",
-    detail: `旧位置：${oldPath}\n新位置：${newPath}\n备份目录：data/migrations/`,
+    detail: `旧位置：${project.cwd || project.name}\n新位置：${newPath}\n备份目录：data/migrations/`,
     confirmText: "确认迁移",
     tone: "primary"
   });
-  if (!approved) return;
+  if (!result.confirmed) return;
   setGlobalLoading(true, "正在迁移会话", "备份原始 JSONL 并重写 cwd 前缀…");
   try {
-    const result = await post("/api/v2/migrate-project", { project_id: projectId, new_path: newPath });
+    const migrated = await post("/api/v2/migrate-project", { project_id: project.id, new_path: newPath });
     state.projectData.clear();
     state.pathMappings = await api("/api/v2/path-mappings");
-    toast(result.message || "会话迁移完成", result.failed ? "error" : "success");
-    const nextId = result.new_project_id || projectId;
-    navigate("project", { projectId: nextId, projectPath: result.new_path || newPath });
+    toast(migrated.message || "会话迁移完成", migrated.failed ? "error" : "success");
+    await renderSettings(++state.renderToken);
   } catch (error) { toast(error.message, "error"); }
   finally { setGlobalLoading(false); }
 }
 
-async function describeProject(projectId) {
+async function maintenanceDescribeProject(pickerId) {
+  let project;
+  try { project = await maintenanceProject(pickerId); } catch (error) { return; }
   setGlobalLoading(true, "正在生成项目简介", "仅本次操作会调用已配置的 AI 服务…");
   try {
-    const result = await post("/api/describe-project", { project_id: projectId });
-    state.projectData.delete(projectId);
+    const result = await post("/api/describe-project", { project_id: project.id });
+    state.projectData.delete(project.id);
     toast(result.ok ? "项目简介已更新" : result.message || "生成失败", result.ok ? "success" : "error");
-    await renderProject(++state.renderToken, projectId, true);
+    await renderSettings(++state.renderToken);
   } catch (error) { toast(error.message, "error"); }
   finally { setGlobalLoading(false); }
 }
 
-async function summarizeProject(projectId, total) {
-  const approved = await askConfirm({
+async function maintenanceSummarizeProject(pickerId) {
+  let project;
+  try { project = await maintenanceProject(pickerId); } catch (error) { return; }
+  const result = await askConfirm({
     eyebrow: "AI 消耗确认",
     title: "批量总结项目会话",
     message: "此操作会连续调用 AI API，为尚无摘要的会话生成总结。已有摘要会自动跳过，可能产生 API 费用并需要较长时间。",
-    detail: `项目会话：${total} 个\n单次后端处理上限：500 个`,
+    detail: `项目：${project.cwd || project.name}\n单次后端处理上限：500 个`,
     confirmText: "开始总结",
     tone: "primary"
   });
-  if (!approved) return;
-  state.summaryProgress.set(projectId, { running: true, total, processed: 0, skipped: 0, failed: 0 });
-  await renderProject(++state.renderToken, projectId);
+  if (!result.confirmed) return;
+  setGlobalLoading(true, "正在批量总结会话", "连续调用 AI 为会话生成总结，请保持管理器运行…");
   try {
-    const result = await post("/api/summarize-all", { project_id: projectId });
-    state.summaryProgress.set(projectId, { running: false, total: result.total || total, processed: (result.success || 0) + (result.skipped || 0) + (result.failed || 0), skipped: result.skipped || 0, failed: result.failed || 0, percent: 100 });
-    state.projectData.delete(projectId);
-    toast(result.message || "批量总结完成", result.failed ? "error" : "success");
-  } catch (error) {
-    state.summaryProgress.set(projectId, { running: false, total, processed: 0, skipped: 0, failed: 1, percent: 100 });
-    toast(error.message, "error");
-  }
-  await renderProject(++state.renderToken, projectId, true);
+    const summarized = await post("/api/summarize-all", { project_id: project.id });
+    state.projectData.delete(project.id);
+    toast(summarized.message || "批量总结完成", summarized.failed ? "error" : "success");
+    await renderSettings(++state.renderToken);
+  } catch (error) { toast(error.message, "error"); }
+  finally { setGlobalLoading(false); }
+}
+
+async function maintenanceTrashProject(pickerId) {
+  let project;
+  try { project = await maintenanceProject(pickerId); } catch (error) { return; }
+  const result = await askConfirm({
+    title: "将项目移到回收站",
+    message: "此操作会移动该项目的原始 Claude JSONL 记录。当前 UI 暂不提供恢复入口，请确认后继续。",
+    detail: `${project.cwd || project.name}\n→ data/trash/projects/`,
+    confirmText: "移到回收站"
+  });
+  if (!result.confirmed) return;
+  try {
+    const trashed = await post("/api/v2/trash-project", { project_id: project.id });
+    state.projectData.delete(project.id);
+    toast(trashed.message || "项目已移到回收站", "success");
+    await renderSettings(++state.renderToken);
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function summarizeSession(projectId, sessionId) {
@@ -1797,24 +1942,28 @@ async function summarizeSession(projectId, sessionId) {
   finally { setGlobalLoading(false); }
 }
 
-async function trashProject(projectId, path) {
-  const approved = await askConfirm({ title: "将项目移到回收站", message: "此操作会移动该项目的原始 Claude JSONL 记录。当前 UI 暂不提供恢复入口，请确认后继续。", detail: `${path}\n→ data/trash/projects/`, confirmText: "移到回收站" });
-  if (!approved) return;
+async function trashSession(projectId, sessionId, logicalProjectId = projectId, { descendantCount = 0, kind = "" } = {}) {
+  const canCascade = Number(descendantCount) > 0 && kind !== "subagent" && kind !== "teammate";
+  let cascade = false;
+  if (canCascade) {
+    const result = await askConfirm({
+      title: "将会话移到回收站",
+      message: `该会话包含 ${descendantCount} 个下属会话（子代理 / 队友）。回收时会连带处理这些下属会话。`,
+      detail: `会话：${sessionId}\n下属会话：${descendantCount} 个\n→ data/trash/sessions/`,
+      confirmText: "移到回收站",
+      checkbox: { label: `连同 ${descendantCount} 个下属会话一起回收`, checked: true }
+    });
+    if (!result.confirmed) return;
+    cascade = result.checkbox;
+  } else {
+    const result = await askConfirm({ title: "将会话移到回收站", message: "只移动该会话的 JSONL 文件；父会话、其他会话与项目工作区均不受影响。当前 UI 暂不提供回收站恢复入口。", detail: `会话：${sessionId}\n→ data/trash/sessions/`, confirmText: "移到回收站" });
+    if (!result.confirmed) return;
+  }
   try {
-    const result = await post("/api/v2/trash-project", { project_id: projectId });
-    state.projectData.delete(projectId);
-    toast(result.message || "项目已移到回收站", "success");
-    navigate("projects");
-  } catch (error) { toast(error.message, "error"); }
-}
-
-async function trashSession(projectId, sessionId, logicalProjectId = projectId) {
-  const approved = await askConfirm({ title: "将会话移到回收站", message: "只移动该会话的 JSONL 文件；父会话、其他会话与项目工作区均不受影响。当前 UI 暂不提供回收站恢复入口。", detail: `会话：${sessionId}\n→ data/trash/sessions/`, confirmText: "移到回收站" });
-  if (!approved) return;
-  try {
-    const result = await post("/api/v2/trash-session", { project_id: projectId, session_id: sessionId });
+    const result = await post("/api/v2/trash-session", { project_id: projectId, session_id: sessionId, cascade });
     state.projectData.delete(logicalProjectId);
-    toast(result.message || "会话已移到回收站", "success");
+    const trashedCount = Array.isArray(result.trashed) ? result.trashed.length : 0;
+    toast(result.message || (cascade && trashedCount ? `已回收 ${trashedCount} 个会话` : "会话已移到回收站"), "success");
     if (state.route === "session") navigate("project", { projectId: logicalProjectId, projectPath: state.projectNames.get(logicalProjectId) || "" });
     else await renderCurrentPage();
   } catch (error) { toast(error.message, "error"); }
@@ -1823,14 +1972,14 @@ async function trashSession(projectId, sessionId, logicalProjectId = projectId) 
 async function trashSelectedProjects() {
   const ids = [...state.selectedProjects];
   if (!ids.length) return;
-  const approved = await askConfirm({ title: `移动 ${ids.length} 个项目到回收站`, message: "选中项目的原始 JSONL 目录将移动到 data/trash/projects/。这是批量文件移动操作。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
-  if (!approved) return;
+  const result = await askConfirm({ title: `移动 ${ids.length} 个项目到回收站`, message: "选中项目的原始 JSONL 目录将移动到 data/trash/projects/。这是批量文件移动操作。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
+  if (!result.confirmed) return;
   setGlobalLoading(true, "正在批量移动项目", `处理 ${ids.length} 个项目…`);
   try {
-    const result = await post("/api/v2/trash-projects", { project_ids: ids });
+    const trashed = await post("/api/v2/trash-projects", { project_ids: ids });
     state.selectedProjects.clear();
     state.projectData.clear();
-    toast(result.message || "批量移动完成", result.failed ? "error" : "success");
+    toast(trashed.message || "批量移动完成", trashed.failed ? "error" : "success");
     await renderCurrentPage();
   } catch (error) { toast(error.message, "error"); }
   finally { setGlobalLoading(false); }
@@ -1839,14 +1988,14 @@ async function trashSelectedProjects() {
 async function trashSelectedSessions(projectId) {
   const ids = [...selectedSessionSet(projectId)];
   if (!ids.length) return;
-  const approved = await askConfirm({ title: `移动 ${ids.length} 个会话到回收站`, message: "只移动选中的会话 JSONL（含自动会话）；父会话不会被连带删除。单次最多处理 500 个会话。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
-  if (!approved) return;
+  const result = await askConfirm({ title: `移动 ${ids.length} 个会话到回收站`, message: "只移动选中的会话 JSONL（含自动会话）；父会话不会被连带删除。单次最多处理 500 个会话。", detail: ids.join("\n"), confirmText: "批量移到回收站" });
+  if (!result.confirmed) return;
   setGlobalLoading(true, "正在批量移动会话", `处理 ${ids.length} 个会话…`);
   try {
-    const result = await post("/api/v2/trash-sessions", { project_id: projectId, session_ids: ids });
+    const trashed = await post("/api/v2/trash-sessions", { project_id: projectId, session_ids: ids });
     selectedSessionSet(projectId).clear();
     state.projectData.delete(projectId);
-    toast(result.message || "批量移动完成", result.failed ? "error" : "success");
+    toast(trashed.message || "批量移动完成", trashed.failed ? "error" : "success");
     await renderProject(++state.renderToken, projectId, true);
   } catch (error) { toast(error.message, "error"); }
   finally { setGlobalLoading(false); }
@@ -1877,8 +2026,8 @@ function saveLaunchPreferences(showToast = true) {
 }
 
 async function describeAll() {
-  const approved = await askConfirm({ eyebrow: "AI 消耗确认", title: "为所有项目生成简介", message: "此操作会依次为所有项目调用 AI 服务，可能耗时较长并产生 API 费用。", confirmText: "开始生成", tone: "primary" });
-  if (!approved) return;
+  const result = await askConfirm({ eyebrow: "AI 消耗确认", title: "为所有项目生成简介", message: "此操作会依次为所有项目调用 AI 服务，可能耗时较长并产生 API 费用。", confirmText: "开始生成", tone: "primary" });
+  if (!result.confirmed) return;
   setGlobalLoading(true, "正在生成全部项目简介", "请保持管理器运行，完成后会显示结果…");
   try {
     const result = await post("/api/describe-all", {});
@@ -1923,7 +2072,11 @@ document.addEventListener("click", async (event) => {
     return;
   }
   const routeTarget = event.target.closest("[data-route]");
-  if (routeTarget) { navigate(routeTarget.dataset.route); return; }
+  if (routeTarget) {
+    if (routeTarget.dataset.route === "sessions") state.sessions.offset = 0;
+    navigate(routeTarget.dataset.route);
+    return;
+  }
   if (!event.target.closest(".shutdown-wrap")) {
     $("#shutdown-popover").hidden = true;
     $("#shutdown-menu-button").setAttribute("aria-expanded", "false");
@@ -1940,7 +2093,7 @@ document.addEventListener("change", (event) => {
     const set = selectedSessionSet(target.dataset.projectId);
     target.checked ? set.add(target.dataset.sessionId) : set.delete(target.dataset.sessionId);
     updateBatchVisibility("session");
-  } else if (action === "project-filter") executeAction("project-filter", target);
+  } else if (action === "project-filter" || action === "session-team-change") executeAction(action, target);
   else if (action === "provider-change") {
     const model = $("#config-model");
     populateModels(model, target.value);

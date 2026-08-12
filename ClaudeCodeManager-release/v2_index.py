@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 HISTORY_INDEX_VERSION = 1
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_READY = {}
@@ -104,6 +104,10 @@ def init_db(conn):
             task_kind TEXT NOT NULL DEFAULT '',
             team_id TEXT NOT NULL DEFAULT '',
             team_confidence TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            meta_json TEXT NOT NULL DEFAULT '',
+            link_source TEXT NOT NULL DEFAULT '',
+            jsonl_rel_path TEXT NOT NULL DEFAULT '',
             indexed_at REAL NOT NULL,
             PRIMARY KEY (project_id, id)
         );
@@ -149,6 +153,11 @@ def init_db(conn):
             detected_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS orphan_tombstones (
+            session_id TEXT PRIMARY KEY,
+            removed_at TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS teams (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
@@ -175,6 +184,7 @@ def init_db(conn):
             session_id TEXT NOT NULL DEFAULT '',
             session_project_id TEXT NOT NULL DEFAULT '',
             match_confidence TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (team_id, agent_id)
         );
 
@@ -221,6 +231,10 @@ def init_db(conn):
             "task_kind": "TEXT NOT NULL DEFAULT ''",
             "team_id": "TEXT NOT NULL DEFAULT ''",
             "team_confidence": "TEXT NOT NULL DEFAULT ''",
+            "kind": "TEXT NOT NULL DEFAULT ''",
+            "meta_json": "TEXT NOT NULL DEFAULT ''",
+            "link_source": "TEXT NOT NULL DEFAULT ''",
+            "jsonl_rel_path": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in migrations.items():
             if name not in columns:
@@ -241,6 +255,9 @@ def init_db(conn):
         history_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orphan_history_sessions)")}
         if "is_orphan" not in history_columns:
             conn.execute("ALTER TABLE orphan_history_sessions ADD COLUMN is_orphan INTEGER NOT NULL DEFAULT 1")
+        member_columns = {row["name"] for row in conn.execute("PRAGMA table_info(team_members)")}
+        if "role" not in member_columns:
+            conn.execute("ALTER TABLE team_members ADD COLUMN role TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -326,7 +343,14 @@ def _refresh_orphan_history(conn, projects_dir):
 
         conn.execute("DELETE FROM orphan_history_sessions")
         now = time.time()
+        # Explicitly removed records stay removed: tombstones filter the
+        # history rebuild so a changed history.jsonl never resurrects them.
+        tombstoned = {
+            row["session_id"] for row in conn.execute("SELECT session_id FROM orphan_tombstones")
+        }
         for session_id, item in grouped.items():
+            if session_id in tombstoned:
+                continue
             rows = item["rows"]
             prompts = [_history_prompt(row) for row in rows]
             substantive = [prompt for prompt in prompts if _is_substantive_history_prompt(prompt)]
@@ -382,6 +406,20 @@ def _public_session(row):
         return None
     item["record_project_id"] = item.get("project_id", "")
     item["project_id"] = item.get("logical_project_id") or item["record_project_id"]
+    return item
+
+
+def _slim_public_session(item):
+    """Strip physical details from a public session dict (invariant 7.3).
+
+    record_project_id / jsonl_rel_path / file_path / meta_json never leave
+    this module; session_detail resolves them internally, then strips them
+    from the returned session and parent objects.
+    """
+    if not item:
+        return item
+    for key in ("file_path", "jsonl_rel_path", "meta_json", "record_project_id"):
+        item.pop(key, None)
     return item
 
 
@@ -811,6 +849,75 @@ def _job_session_ids(projects_dir):
     return result
 
 
+def _teams_member_index(teams_dir):
+    """Flatten (team_id, member_agent_id, member_name) from every team config.
+
+    Feeds the kind decision tree's config branch (contract §3.1). Lead member
+    rows are excluded so a stale lead transcript can never surface as a
+    teammate. Unreadable configs contribute nothing, matching the cascade.
+    """
+    index = []
+    if not os.path.isdir(teams_dir):
+        return index
+    for name in sorted(os.listdir(teams_dir)):
+        config_path = os.path.join(teams_dir, name, "config.json")
+        if not os.path.isfile(config_path):
+            continue
+        try:
+            with open(config_path, "r", encoding="utf-8", errors="replace") as stream:
+                config = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(config, dict):
+            continue
+        lead_agent_id = str(config.get("leadAgentId") or "")
+        for member in config.get("members") or []:
+            if not isinstance(member, dict) or not member.get("agentId"):
+                continue
+            member_agent_id = str(member.get("agentId") or "")
+            if member_agent_id == lead_agent_id or "team-lead" in member_agent_id:
+                continue
+            index.append((name, member_agent_id, str(member.get("name") or "")))
+    return index
+
+
+def _config_member_match(agent_id, member_index):
+    """Return (team_id, member_agent_id) of the unique config member hit.
+
+    Exact agentId equality wins over name-prefix matches; each must resolve
+    to exactly one (team, member) pair across all configs (§3.1 唯一性检查).
+    """
+    exact, prefix = [], []
+    for team_id, member_agent_id, member_name in member_index:
+        if agent_id == member_agent_id:
+            exact.append((team_id, member_agent_id))
+        elif _agent_id_matches_member(agent_id, member_name):
+            prefix.append((team_id, member_agent_id))
+    hits = exact or prefix
+    return hits[0] if len(hits) == 1 else None
+
+
+def _classify_nested(agent_meta, agent_id, member_index):
+    """Kind decision for nested <lead>/subagents/ logs (contract §3.1)."""
+    if agent_meta.get("task_kind") == "in_process_teammate":
+        return "teammate", "meta"
+    if _config_member_match(agent_id, member_index):
+        return "teammate", "config"
+    return "subagent", "exact"
+
+
+def _jsonl_rel_path(file_path, projects_dir):
+    """Physical transcript path relative to the data dir, forward slashes.
+
+    Internal-only storage for the IO layer (recycle / on-demand reads);
+    the API contract forbids exposing it (§3.2, invariant 7.3).
+    """
+    try:
+        return os.path.relpath(file_path, os.path.dirname(projects_dir)).replace("\\", "/")
+    except ValueError:
+        return ""
+
+
 def _infer_job_parents(direct_sessions):
     """Infer cloned job lineage only when message identity overlap is decisive."""
     parents = {}
@@ -868,31 +975,60 @@ def _read_agent_meta(jsonl_path):
     }
 
 
+def _agent_meta_json(agent_meta):
+    """Fold agent metadata into the meta_json payload (§3.2).
+
+    Only the display fields are stored — member cwd and any other path from
+    the sidecar never enter this payload (invariant 7.8).
+    """
+    if not agent_meta:
+        return ""
+    payload = {
+        "type": str(agent_meta.get("agent_type") or ""),
+        "name": str(agent_meta.get("agent_name") or ""),
+        "description": str(agent_meta.get("agent_description") or ""),
+        "color": str(agent_meta.get("agent_color") or ""),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 _AGENT_META_COLUMNS = (
     "agent_type", "agent_name", "agent_description",
     "agent_color", "task_kind", "team_id",
 )
 
 
-def _update_session_agent_meta(conn, project_id, session_id, agent_meta):
-    """Refresh teammate columns for a gated file without re-reading its log."""
+def _update_session_agent_meta(conn, project_id, session_id, agent_meta, kind, link_source):
+    """Refresh teammate columns for a gated file without re-reading its log.
+
+    The .meta.json sidecar can change without touching the JSONL, so the
+    folded meta_json plus the tree-derived kind/link_source are refreshed
+    here as well to keep every scan a complete decision-tree pass.
+    """
     stored = conn.execute(
-        "SELECT agent_type, agent_name, agent_description, agent_color, task_kind, team_id "
+        "SELECT agent_type, agent_name, agent_description, agent_color, task_kind, team_id, "
+        "kind, link_source, meta_json "
         "FROM sessions WHERE project_id = ? AND id = ?",
         (project_id, session_id),
     ).fetchone()
     if stored is None:
         return
+    new_values = {
+        column: str(agent_meta.get(column) or "") for column in _AGENT_META_COLUMNS
+    }
+    new_values["kind"] = kind
+    new_values["link_source"] = link_source
+    new_values["meta_json"] = _agent_meta_json(agent_meta)
     changes = [
-        column for column in _AGENT_META_COLUMNS
-        if (stored[column] or "") != str(agent_meta.get(column) or "")
+        column for column, value in new_values.items()
+        if (stored[column] or "") != value
     ]
     if not changes:
         return
     assignments = ", ".join(column + " = ?" for column in changes)
     conn.execute(
         f"UPDATE sessions SET {assignments} WHERE project_id = ? AND id = ?",
-        [str(agent_meta.get(column) or "") for column in changes] + [project_id, session_id],
+        [new_values[column] for column in changes] + [project_id, session_id],
     )
 
 
@@ -965,18 +1101,25 @@ def _upsert_team(conn, team_id, config, now):
         for member in config.get("members") or []:
             if not isinstance(member, dict) or not member.get("agentId"):
                 continue
+            member_agent_id = str(member.get("agentId") or "")
+            role = (
+                "lead"
+                if (member_agent_id == lead_agent_id or "team-lead" in member_agent_id)
+                else "member"
+            )
             conn.execute(
                 """
-                INSERT INTO team_members(team_id, agent_id, name, color, joined_at, agent_type)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO team_members(team_id, agent_id, name, color, joined_at, agent_type, role)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     team_id,
-                    str(member.get("agentId") or ""),
+                    member_agent_id,
                     str(member.get("name") or ""),
                     str(member.get("color") or ""),
                     str(member.get("joinedAt") or ""),
                     str(member.get("agentType") or ""),
+                    role,
                 ),
             )
         return
@@ -1000,7 +1143,7 @@ def _refresh_teams(conn, teams_dir):
     """
     now = time.time()
     session_rows = [dict(row) for row in conn.execute(
-        "SELECT project_id, id, parent_session_id, agent_id, task_kind, team_id, last_active "
+        "SELECT project_id, id, parent_session_id, agent_id, task_kind, team_id, last_active, meta_json "
         "FROM sessions ORDER BY last_active DESC"
     )]
     if not os.path.isdir(teams_dir):
@@ -1053,8 +1196,9 @@ def _refresh_teams(conn, teams_dir):
         "SELECT id, name, lead_session_id, lead_agent_id FROM teams"
     )]
     member_rows = [dict(row) for row in conn.execute(
-        "SELECT team_id, agent_id, name FROM team_members"
+        "SELECT team_id, agent_id, name, color, agent_type FROM team_members"
     )]
+    member_row_by_key = {(row["team_id"], row["agent_id"]): row for row in member_rows}
     members_by_team = {}
     for row in member_rows:
         members_by_team.setdefault(row["team_id"], []).append(row)
@@ -1138,19 +1282,36 @@ def _refresh_teams(conn, teams_dir):
             name_to_teams.setdefault(team["id"].lower(), []).append(team)
         if team["name"]:
             name_to_teams.setdefault(team["name"].lower(), []).append(team)
+    name_only_keys = set()
     for row in session_rows:
         key = (row["project_id"], row["id"])
         if key in session_assign:
             continue
-        candidates = name_to_teams.get((row["team_id"] or "").lower(), [])
+        team_ref = (row["team_id"] or "").lower()
+        candidates = name_to_teams.get(team_ref, [])
         if len(candidates) == 1:
+            if not any(candidate["id"].lower() == team_ref for candidate in candidates):
+                # Team link established purely by display name (weakest evidence).
+                name_only_keys.add(key)
             offer(key, candidates[0]["id"], "team_name")
 
     for key, (team_id, confidence) in session_assign.items():
+        link_sql = ", link_source = 'name_only'" if key in name_only_keys else ""
         conn.execute(
-            "UPDATE sessions SET team_id = ?, team_confidence = ? WHERE project_id = ? AND id = ?",
+            f"UPDATE sessions SET team_id = ?, team_confidence = ?{link_sql} WHERE project_id = ? AND id = ?",
             (team_id, confidence, key[0], key[1]),
         )
+    # Member roles derive from config every scan, so cached configs (whose
+    # member rows are not re-inserted) still carry correct roles.
+    conn.execute(
+        """
+        UPDATE team_members
+        SET role = CASE
+            WHEN agent_id = (SELECT lead_agent_id FROM teams WHERE teams.id = team_members.team_id)
+              OR agent_id LIKE '%team-lead%'
+            THEN 'lead' ELSE 'member' END
+        """
+    )
     leads_by_team = {team["id"]: team["lead_session_id"] or "" for team in team_rows}
     for (team_id, member_agent_id), (row, confidence) in member_claims.items():
         conn.execute(
@@ -1171,6 +1332,27 @@ def _refresh_teams(conn, teams_dir):
                 "WHERE project_id = ? AND id = ?",
                 (row["project_id"], row["id"]),
             )
+            # Sessions matched from the config alone (decision tree config
+            # branch, no .meta.json) carry an empty meta_json; fill the agent
+            # display fields from the member row so the §4.1 agent object and
+            # the legacy agent columns stay rich.
+            member_row = member_row_by_key.get((team_id, member_agent_id))
+            existing_agent = _agent_from_meta_json(row["meta_json"] or "")
+            if member_row and not existing_agent["name"] and (
+                member_row["name"] or member_row["agent_type"] or member_row["color"]
+            ):
+                payload = _agent_meta_json({
+                    "agent_type": member_row["agent_type"],
+                    "agent_name": member_row["name"],
+                    "agent_description": "",
+                    "agent_color": member_row["color"],
+                })
+                conn.execute(
+                    "UPDATE sessions SET meta_json = ?, agent_type = ?, agent_name = ?, agent_color = ? "
+                    "WHERE project_id = ? AND id = ?",
+                    (payload, member_row["agent_type"], member_row["name"],
+                     member_row["color"], row["project_id"], row["id"]),
+                )
 
     # Drop teams whose directory disappeared and clear dangling session links.
     existing_ids = {row["id"] for row in conn.execute("SELECT id FROM teams")}
@@ -1246,6 +1428,7 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
         ):
             known_record_paths.setdefault(row["project_id"], row["cwd_initial"] or row["cwd"])
         job_session_ids = _job_session_ids(projects_dir)
+        teams_member_index = _teams_member_index(os.path.join(os.path.dirname(projects_dir), "teams"))
         for project_id in sorted(os.listdir(projects_dir)):
             folder_path = os.path.join(projects_dir, project_id)
             if not os.path.isdir(folder_path):
@@ -1281,7 +1464,15 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                     and int(old["size"]) == int(st.st_size)
                 ):
                     if parent_session_id:
-                        _update_session_agent_meta(conn, project_id, session_id, agent_meta)
+                        # The decision tree runs on gated files too, so kind and
+                        # link_source follow .meta.json / team config changes
+                        # without re-reading the log.
+                        kind, link_source = _classify_nested(
+                            agent_meta, path_agent_id, teams_member_index
+                        )
+                        _update_session_agent_meta(
+                            conn, project_id, session_id, agent_meta, kind, link_source
+                        )
                     continue
 
                 # Subagent logs can be numerous and very large. Their role in the
@@ -1291,22 +1482,25 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                 meta = _session_meta(entries, fix_text)
                 usage_events = _extract_api_usage_events(file_path, project_id, session_id)
                 if parent_session_id:
-                    session_kind = "subagent"
-                    relation_confidence = "exact"
+                    kind, link_source = _classify_nested(
+                        agent_meta, meta["agent_id"] or path_agent_id, teams_member_index
+                    )
                 elif session_id in job_session_ids:
-                    session_kind = "job"
-                    relation_confidence = ""
+                    kind, link_source = "job", ""
                 elif meta["entrypoint"] == "sdk-cli":
-                    session_kind = "sdk"
-                    relation_confidence = ""
+                    kind, link_source = "sdk", ""
                 else:
-                    session_kind = "primary"
-                    relation_confidence = ""
+                    kind, link_source = "primary", ""
+                # Transition backfill: session_kind keeps the historical values
+                # (nested files were all "subagent" pre-v6) while the new kind
+                # column carries the decision-tree result.
+                session_kind = "subagent" if parent_session_id else kind
+                relation_confidence = "exact" if parent_session_id else ""
                 if not parent_session_id:
                     direct_sessions.append({
                         "project_id": project_id,
                         "id": session_id,
-                        "kind": session_kind,
+                        "kind": kind,
                         "uuids": set(meta["message_uuids"]),
                         "file_created": st.st_ctime,
                     })
@@ -1326,8 +1520,8 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                         parent_project_id, parent_session_id, agent_id, relation_confidence,
                         entrypoint, child_count, logical_project_id, path_exists, grouping_reason,
                         agent_type, agent_name, agent_description, agent_color, task_kind,
-                        team_id, indexed_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        team_id, kind, meta_json, link_source, jsonl_rel_path, indexed_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project_id,
@@ -1364,6 +1558,10 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
                         agent_meta.get("agent_color", ""),
                         agent_meta.get("task_kind", ""),
                         agent_meta.get("team_id", ""),
+                        kind,
+                        _agent_meta_json(agent_meta),
+                        link_source,
+                        _jsonl_rel_path(file_path, projects_dir),
                         now,
                     ),
                 )
@@ -1423,7 +1621,9 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
         inferred_parents = _infer_job_parents(direct_sessions)
         for (project_id, session_id), parent_session_id in inferred_parents.items():
             conn.execute(
-                "UPDATE sessions SET parent_project_id = ?, parent_session_id = ?, relation_confidence = 'high' WHERE project_id = ? AND id = ?",
+                "UPDATE sessions SET parent_project_id = ?, parent_session_id = ?, "
+                "relation_confidence = 'high', link_source = 'inferred' "
+                "WHERE project_id = ? AND id = ?",
                 (project_id, parent_session_id, project_id, session_id),
             )
 
@@ -1485,9 +1685,9 @@ def scan_incremental(db_path, projects_dir, read_jsonl, fix_text, force=False):
             conn.execute(
                 """
                 UPDATE projects SET
-                    session_count = COALESCE((SELECT COUNT(*) FROM sessions WHERE logical_project_id = projects.id AND session_kind = 'primary' AND parent_session_id = ''), 0),
-                    total_messages = COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE logical_project_id = projects.id AND session_kind = 'primary' AND parent_session_id = ''), 0),
-                    total_tokens = COALESCE((SELECT SUM(total_tokens) FROM sessions WHERE logical_project_id = projects.id AND session_kind = 'primary' AND parent_session_id = ''), 0),
+                    session_count = COALESCE((SELECT COUNT(*) FROM sessions WHERE logical_project_id = projects.id AND kind = 'primary'), 0),
+                    total_messages = COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE logical_project_id = projects.id AND kind = 'primary'), 0),
+                    total_tokens = COALESCE((SELECT SUM(total_tokens) FROM sessions WHERE logical_project_id = projects.id AND kind = 'primary'), 0),
                     last_active = COALESCE((SELECT MAX(last_active) FROM sessions WHERE logical_project_id = projects.id), ''),
                     cwd = COALESCE(NULLIF(name, ''), cwd)
                 """
@@ -1525,23 +1725,25 @@ def dashboard(db_path, today=None):
                 SELECT
                     (SELECT COUNT(*) FROM projects) AS total_projects,
                     (SELECT COUNT(*) FROM teams) AS total_teams,
-                    (SELECT COUNT(*) FROM sessions WHERE session_kind = 'primary' AND parent_session_id = '') AS total_sessions,
-                    (SELECT COUNT(*) FROM sessions WHERE session_kind != 'primary' OR parent_session_id != '') AS total_automatic_sessions,
+                    (SELECT COUNT(*) FROM sessions WHERE kind = 'primary') AS total_sessions,
+                    (SELECT COUNT(*) FROM sessions WHERE kind != 'primary') AS total_automatic_sessions,
                     (SELECT COUNT(*) FROM sessions) AS total_all_sessions,
                     (SELECT COUNT(*) FROM orphan_history_sessions WHERE is_orphan = 1 AND substantive_count > 0) AS total_orphan_history_sessions,
-                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE session_kind = 'primary' AND parent_session_id = ''), 0) AS total_messages,
-                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE session_kind = 'primary' AND parent_session_id = ''), 0) AS total_primary_messages,
-                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE session_kind != 'primary' OR parent_session_id != ''), 0) AS total_automatic_messages,
+                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE kind = 'primary'), 0) AS total_messages,
+                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE kind = 'primary'), 0) AS total_primary_messages,
+                    COALESCE((SELECT SUM(total_msgs) FROM sessions WHERE kind != 'primary'), 0) AS total_automatic_messages,
                     COALESCE((SELECT SUM(total_msgs) FROM sessions), 0) AS total_all_messages
                 """
             ).fetchone()
         )
+        by_kind = _facet_kinds(conn, "", [])
+        counts["by_kind"] = by_kind
         recent = [_public_session(r) for r in conn.execute(
             """
             SELECT s.*, p.name AS project_name
             FROM sessions s
             JOIN projects p ON p.id = s.logical_project_id
-            WHERE s.session_kind = 'primary' AND s.parent_session_id = ''
+            WHERE s.kind = 'primary'
             ORDER BY s.last_active DESC
             LIMIT 12
             """
@@ -1704,11 +1906,20 @@ def list_projects(db_path, q="", drive="", sort="active", path_prefix="", limit=
         total = conn.execute("SELECT COUNT(*) AS c FROM projects" + where_sql, params).fetchone()["c"]
         rows = [_row_dict(r) for r in conn.execute(
             f"""SELECT projects.*,
-                       (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id AND (s.session_kind != 'primary' OR s.parent_session_id != '')) AS automatic_session_count,
+                       (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id AND s.kind != 'primary') AS automatic_session_count,
                        (SELECT COUNT(*) FROM sessions s WHERE s.logical_project_id = projects.id) AS all_session_count
                 FROM projects{where_sql} ORDER BY {order} LIMIT ? OFFSET ?""",
             params + [limit, offset],
         )]
+        facets = {}
+        for facet_row in conn.execute(
+            "SELECT logical_project_id, kind, COUNT(*) AS c FROM sessions GROUP BY logical_project_id, kind"
+        ):
+            bucket = facets.setdefault(facet_row["logical_project_id"], {kind: 0 for kind in _KIND_VALUES})
+            if facet_row["kind"] in bucket:
+                bucket[facet_row["kind"]] = facet_row["c"]
+        for row in rows:
+            row["by_kind"] = facets.get(row["id"], {kind: 0 for kind in _KIND_VALUES})
         drives = [r["drive"] for r in conn.execute(
             """
             SELECT DISTINCT upper(substr(cwd, 1, 2)) AS drive
@@ -1748,6 +1959,8 @@ def list_teams(db_path, q="", limit=80, offset=0):
             # Display-only cwd derived from the indexed lead session; member
             # cwd from the config is never persisted.
             item["cwd"] = item.pop("lead_cwd") or ""
+            # Team chips count from the kind facet (§3.4), not stored counters.
+            item["by_kind"] = _facet_kinds(conn, "s.team_id = ?", [item["id"]])
             rows.append(item)
         return {"items": rows, "total": total, "limit": limit, "offset": offset}
     finally:
@@ -1762,6 +1975,7 @@ def team_detail(db_path, team_id):
         team = _row_dict(conn.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone())
         if not team:
             return None
+        team["by_kind"] = _facet_kinds(conn, "s.team_id = ?", [team_id])
         lead = {"agent_id": team["lead_agent_id"], "session": None}
         if team["lead_session_id"]:
             lead_row = conn.execute(
@@ -1792,6 +2006,7 @@ def team_detail(db_path, team_id):
                 "color": row["color"],
                 "joined_at": row["joined_at"],
                 "agent_type": row["agent_type"],
+                "role": row["role"] or "",
                 "confidence": row["match_confidence"],
                 "session": None,
                 "logical_project_id": "",
@@ -1818,89 +2033,146 @@ def team_detail(db_path, team_id):
         conn.close()
 
 
-def _attach_children(conn, rows):
-    for row in rows:
-        record_project_id = row.get("record_project_id") or row.get("project_id")
-        children = [_public_session(child) for child in conn.execute(
-            """
-            SELECT s.*, p.name AS project_name, t.name AS team_name
-            FROM sessions s
-            JOIN projects p ON p.id = s.logical_project_id
-            LEFT JOIN teams t ON t.id = s.team_id
-            WHERE s.parent_project_id = ? AND s.parent_session_id = ?
-            ORDER BY s.last_active DESC
-            """,
-            (record_project_id, row["id"]),
-        )]
-        row["children"] = children
-    return rows
+_KIND_VALUES = ("primary", "job", "sdk", "subagent", "teammate")
 
 
-def _attach_parents(conn, rows):
-    """Attach each automatic session's parent row (when known) to flat lists."""
-    for row in rows:
-        parent_session_id = row.get("parent_session_id") or ""
-        if not parent_session_id:
-            row["parent"] = None
-            continue
-        parent = conn.execute(
-            """
-            SELECT s.*, p.name AS project_name, t.name AS team_name
-            FROM sessions s
-            JOIN projects p ON p.id = s.logical_project_id
-            LEFT JOIN teams t ON t.id = s.team_id
-            WHERE s.project_id = ? AND s.id = ?
-            """,
-            (row.get("parent_project_id") or row.get("record_project_id") or "", parent_session_id),
-        ).fetchone()
-        row["parent"] = _public_session(parent) if parent else None
-    return rows
+def _facet_kinds(conn, where, params):
+    """Count sessions per kind over one filtered set (contract §3.4).
+
+    ``where`` is a bare WHERE fragment referencing sessions aliased as ``s``
+    (e.g. "s.team_id = ?") with ``params`` for it; pass "" for the full table.
+    The returned dict always carries all five kind keys.
+    """
+    facet = {kind: 0 for kind in _KIND_VALUES}
+    where_sql = (" WHERE " + where) if where else ""
+    for row in conn.execute(
+        "SELECT kind, COUNT(*) AS c FROM sessions s" + where_sql + " GROUP BY kind",
+        params,
+    ):
+        if row["kind"] in facet:
+            facet[row["kind"]] = row["c"]
+    return facet
 
 
-def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, kind="primary"):
-    """List sessions filtered by kind: primary (default), automatic or all.
+def _agent_from_meta_json(meta_json):
+    """Unpack the folded agent metadata payload (§4.1 agent sub-object)."""
+    try:
+        payload = json.loads(meta_json) if meta_json else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "type": str(payload.get("type") or ""),
+        "name": str(payload.get("name") or ""),
+        "description": str(payload.get("description") or ""),
+        "color": str(payload.get("color") or ""),
+    }
 
-    kind values:
-      - "primary" (default): main sessions only. Automatic children are nested
-        under their parents and unattached automatic sessions are returned in
-        ``automatic_items`` — the historical behavior.
-      - "automatic": every automatic session (job / sdk / subagent) as a flat
-        list, each carrying parent info when known.
-      - "teammate": every in-process teammate session as a flat list, each
-        carrying its team info.
-      - "all": primary + automatic in one flat, paginated list without nesting,
-        so the same automatic session never appears twice.
 
-    Counts (``primary_total`` / ``automatic_total`` / ``automatic_all_total`` /
-    ``teammate_total`` / ``related_total``) always describe the full project
-    (plus the query filter), independent of the selected kind, so callers can
-    label sections correctly.
+def _session_item(row, descendant_count=0):
+    """Serialize one session row for list_sessions (contract §4.1 + §4.2 + E1).
+
+    Physical details (record dir id, absolute file path, jsonl_rel_path)
+    never leave this module (invariant 7.3); cwd is the one display path the
+    contract keeps. ``session_kind`` mirrors ``kind`` as a transition alias.
+    """
+    kind = row["kind"] or "primary"
+    return {
+        "id": row["id"],
+        "kind": kind,
+        "session_kind": kind,
+        "project_id": row["logical_project_id"] or row["project_id"],
+        "project_name": row["project_name"] or "",
+        "title": row["title"],
+        "cwd": row["cwd"] or "",
+        "first_ts": row["created_at"] or "",
+        "last_ts": row["last_active"] or "",
+        "created_at": row["created_at"] or "",
+        "last_active": row["last_active"] or "",
+        "total_msgs": row["total_msgs"],
+        "total_tokens": row["total_tokens"],
+        "model": row["model"] or "",
+        "first_user_msg": row["first_user_msg"] or "",
+        "parent_session_id": row["parent_session_id"] or "",
+        "parent_title": row["parent_title"] or "",
+        "team_id": row["team_id"] or "",
+        "team_name": row["team_name"] or "",
+        "agent_id": row["agent_id"] or "",
+        "task_kind": row["task_kind"] or "",
+        "team_confidence": row["team_confidence"] or "",
+        "link_source": row["link_source"] or "",
+        "agent": _agent_from_meta_json(row["meta_json"] or ""),
+        "jsonl_available": bool(row["file_path"]) and os.path.isfile(row["file_path"]),
+        "path_exists": row["path_exists"],
+        "descendant_count": descendant_count,
+    }
+
+
+def list_sessions(db_path, kind="all", scope=None, q="", limit=80, offset=0, project_id=None, role=""):
+    """List sessions under the v2.1 contract (design-v2.1 §4.1).
+
+    kind: all (default) | primary | job | sdk | subagent | teammate |
+          automatic (preset = job+sdk+subagent+teammate); unknown values
+          fall back to "all" so sessions are never hidden (C1).
+    scope: None | project:<logical_id> | team:<team_id> | parent:<session_id>.
+    ``project_id`` is the legacy callers' spelling of scope=project:<id> and
+    ``role`` is accepted for historical callers but no longer used.
+
+    by_kind counts the scoped set before the kind filter (chip counts);
+    the §4.2 alias fields derive from the same facet, never a second view.
     """
     conn = connect(db_path)
     try:
         init_db(conn)
-        kind = kind if kind in ("all", "primary", "automatic", "teammate") else "primary"
-        base_where, base_params = [], []
         if project_id:
-            base_where.append("s.logical_project_id = ?")
-            base_params.append(project_id)
+            scope = "project:" + str(project_id)
+        base_where, base_params = [], []
+        if scope:
+            scope_kind, _, scope_value = str(scope).partition(":")
+            scope_kind = scope_kind.strip()
+            scope_value = scope_value.strip()
+            if scope_kind == "project" and scope_value:
+                base_where.append("s.logical_project_id = ?")
+                base_params.append(scope_value)
+            elif scope_kind == "team" and scope_value:
+                base_where.append("s.team_id = ?")
+                base_params.append(scope_value)
+            elif scope_kind == "parent" and scope_value:
+                base_where.append("s.parent_session_id = ?")
+                base_params.append(scope_value)
         if q:
-            base_where.append("(lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?)")
+            base_where.append(
+                "(lower(s.title) LIKE ? OR lower(s.first_user_msg) LIKE ? OR lower(s.cwd) LIKE ?)"
+            )
             like = "%" + q.lower() + "%"
             base_params.extend([like, like, like])
+        base_sql = " AND ".join(base_where)
 
-        kind_where = []
+        # by_kind describes the scoped set before the kind filter (chip counts).
+        by_kind = _facet_kinds(conn, base_sql, base_params)
+
+        kind_where, kind_params = [], []
         if kind == "primary":
-            kind_where = ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
+            kind_where = ["s.kind = 'primary'"]
+        elif kind in ("job", "sdk", "subagent", "teammate"):
+            kind_where, kind_params = ["s.kind = ?"], [kind]
         elif kind == "automatic":
-            kind_where = ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
-        elif kind == "teammate":
-            kind_where = ["s.task_kind = 'in_process_teammate'"]
-        where_sql = " WHERE " + " AND ".join(base_where + kind_where) if (base_where or kind_where) else ""
-        total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + where_sql, base_params).fetchone()["c"]
-        rows = [_public_session(r) for r in conn.execute(
+            kind_where = ["s.kind IN ('job', 'sdk', 'subagent', 'teammate')"]
+        elif kind != "all":
+            kind = "all"  # unknown values fall back to the default view
+        where_parts = base_where + kind_where
+        where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM sessions s" + where_sql,
+            base_params + kind_params,
+        ).fetchone()["c"]
+        rows = conn.execute(
             f"""
-            SELECT s.*, p.name AS project_name, t.name AS team_name
+            SELECT s.*, p.name AS project_name, t.name AS team_name,
+                   (SELECT ps.title FROM sessions ps
+                    WHERE ps.project_id = s.parent_project_id
+                      AND ps.id = s.parent_session_id) AS parent_title
             FROM sessions s
             JOIN projects p ON p.id = s.logical_project_id
             LEFT JOIN teams t ON t.id = s.team_id
@@ -1908,52 +2180,37 @@ def list_sessions(db_path, project_id=None, q="", role="", limit=80, offset=0, k
             ORDER BY s.last_active DESC
             LIMIT ? OFFSET ?
             """,
-            base_params + [limit, offset],
-        )]
-        if kind == "primary":
-            _attach_children(conn, rows)
-        else:
-            _attach_parents(conn, rows)
-
-        primary_where = " WHERE " + " AND ".join(
-            base_where + ["s.session_kind = 'primary'", "s.parent_session_id = ''"]
+            base_params + kind_params + [limit, offset],
+        ).fetchall()
+        descendant_map = _descendant_counts(
+            conn, [(row["project_id"], row["id"]) for row in rows]
         )
-        primary_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + primary_where, base_params).fetchone()["c"]
-        automatic_all_where = " WHERE " + " AND ".join(
-            base_where + ["(s.session_kind != 'primary' OR s.parent_session_id != '')"]
-        )
-        automatic_all_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + automatic_all_where, base_params).fetchone()["c"]
-        teammate_where = " WHERE " + " AND ".join(
-            base_where + ["s.task_kind = 'in_process_teammate'"]
-        )
-        teammate_total = conn.execute("SELECT COUNT(*) AS c FROM sessions s" + teammate_where, base_params).fetchone()["c"]
-        automatic_unattached_where = " WHERE " + " AND ".join(
-            base_where + ["s.session_kind != 'primary'", "s.parent_session_id = ''"]
-        )
-        automatic_unattached_total = conn.execute(
-            "SELECT COUNT(*) AS c FROM sessions s" + automatic_unattached_where, base_params
+        items = [
+            _session_item(row, descendant_map.get((row["project_id"], row["id"]), 0))
+            for row in rows
+        ]
+        nested_where = " WHERE s.parent_session_id != ''"
+        if base_sql:
+            nested_where += " AND " + base_sql
+        related_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM sessions s" + nested_where, base_params
         ).fetchone()["c"]
-        automatic_rows = [_public_session(r) for r in conn.execute(
-            f"""
-            SELECT s.*, p.name AS project_name
-            FROM sessions s JOIN projects p ON p.id = s.logical_project_id
-            {automatic_unattached_where}
-            ORDER BY s.last_active DESC LIMIT 100
-            """,
-            base_params,
-        )]
+        automatic_total = (
+            by_kind["job"] + by_kind["sdk"] + by_kind["subagent"] + by_kind["teammate"]
+        )
         return {
-            "items": rows,
-            "automatic_items": automatic_rows,
+            "items": items,
             "total": total,
-            "primary_total": primary_total,
-            "automatic_total": automatic_unattached_total,
-            "automatic_all_total": automatic_all_total,
-            "teammate_total": teammate_total,
-            "related_total": automatic_all_total,
+            "by_kind": by_kind,
             "limit": limit,
             "offset": offset,
             "kind": kind,
+            # §4.2 transition aliases, all derived from the same facet.
+            "primary_total": by_kind["primary"],
+            "automatic_total": automatic_total,
+            "automatic_all_total": automatic_total,
+            "related_total": related_total,
+            "teammate_total": by_kind["teammate"],
         }
     finally:
         conn.close()
@@ -1976,6 +2233,96 @@ def _builtin_read_jsonl(path, max_entries=None):
     return rows
 
 
+def _descendant_count(conn, record_project_id, session_id):
+    """Count nested descendants at any depth (contract C2 cascade sizing)."""
+    row = conn.execute(
+        """
+        WITH RECURSIVE descendants(session_id) AS (
+            SELECT id FROM sessions
+            WHERE parent_project_id = ? AND parent_session_id = ?
+            UNION ALL
+            SELECT child.id FROM sessions child
+            JOIN descendants d
+              ON child.parent_project_id = ? AND child.parent_session_id = d.session_id
+        )
+        SELECT COUNT(*) AS c FROM descendants
+        """,
+        (record_project_id, session_id, record_project_id),
+    ).fetchone()
+    return row["c"] if row else 0
+
+
+def _descendant_counts(conn, keys):
+    """Batch descendant counts for list items, keyed by (record, id).
+
+    The record dimension keeps cloned session ids in different record dirs
+    from merging their counts (P2-2); the tree never crosses records.
+    """
+    keys = list(dict.fromkeys(
+        (str(project_id), str(session_id))
+        for project_id, session_id in keys
+        if session_id
+    ))
+    if not keys:
+        return {}
+    placeholders = ", ".join("(?, ?)" for _ in keys)
+    params = [value for pair in keys for value in pair]
+    rows = conn.execute(
+        f"""
+        WITH RECURSIVE descendants(root_project, root_id, session_project, session_id) AS (
+            SELECT parent_project_id, parent_session_id, project_id, id
+            FROM sessions
+            WHERE (parent_project_id, parent_session_id) IN ({placeholders})
+            UNION ALL
+            SELECT d.root_project, d.root_id, child.project_id, child.id
+            FROM sessions child
+            JOIN descendants d
+              ON child.parent_session_id = d.session_id
+             AND child.parent_project_id = d.session_project
+        )
+        SELECT root_project, root_id, COUNT(*) AS c
+        FROM descendants GROUP BY root_project, root_id
+        """,
+        params,
+    ).fetchall()
+    return {(row["root_project"], row["root_id"]): row["c"] for row in rows}
+
+
+def remove_orphan_history_sessions(db_path, session_ids):
+    """Explicitly drop orphan history records (C3: the only manual exit).
+
+    Returns the number of removed orphan rows. A tombstone row is written so
+    a later history.jsonl rebuild can never resurrect the record; ids that
+    resolve to indexed sessions are never touched (they live on the normal
+    session lists, not the orphan panel).
+    """
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        ids = [str(session_id) for session_id in (session_ids or []) if session_id]
+        if not ids:
+            return 0
+        removed_at = datetime.now().isoformat(timespec="seconds")
+        removed = 0
+        for session_id in ids:
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone():
+                continue
+            cursor = conn.execute(
+                "DELETE FROM orphan_history_sessions WHERE session_id = ?", (session_id,)
+            )
+            removed += cursor.rowcount
+            conn.execute(
+                "INSERT OR IGNORE INTO orphan_tombstones(session_id, removed_at) VALUES(?, ?)",
+                (session_id, removed_at),
+            )
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
 def session_detail(db_path, project_id, session_id, limit=160, offset=0, role="", read_jsonl=None, fix_text=None):
     conn = connect(db_path)
     try:
@@ -1993,15 +2340,9 @@ def session_detail(db_path, project_id, session_id, limit=160, offset=0, role=""
         if not session:
             return None
         record_project_id = session["record_project_id"]
-        session["children"] = [_public_session(r) for r in conn.execute(
-            """
-            SELECT s.*, p.name AS project_name FROM sessions s
-            JOIN projects p ON p.id = s.logical_project_id
-            WHERE s.parent_project_id = ? AND s.parent_session_id = ?
-            ORDER BY s.last_active DESC
-            """,
-            (record_project_id, session_id),
-        )]
+        # §4.3: nested-session arrays are gone; the browser's parent view
+        # (#sessions?parent=<id>) is the single place to see descendants.
+        session["descendant_count"] = _descendant_count(conn, record_project_id, session_id)
         session["parent"] = _public_session(conn.execute(
             """
             SELECT s.*, p.name AS project_name FROM sessions s
@@ -2058,6 +2399,10 @@ def session_detail(db_path, project_id, session_id, limit=160, offset=0, role=""
                 f"SELECT * FROM messages {where} ORDER BY idx ASC LIMIT ? OFFSET ?",
                 params + [limit, offset],
             )]
+        session["agent"] = _agent_from_meta_json(session.get("meta_json") or "")
+        _slim_public_session(session)
+        if session.get("parent"):
+            _slim_public_session(session["parent"])
         return {
             "session": session,
             "messages": rows,
@@ -2129,7 +2474,7 @@ def search(db_path, q, limit=50, offset=0):
             SELECT 'session' AS type, s.logical_project_id AS project_id,
                    s.project_id AS record_project_id, s.id AS session_id, s.title,
                    s.cwd AS path, '' AS role, s.first_user_msg AS snippet, s.last_active,
-                   s.session_kind, s.task_kind,
+                   s.session_kind, s.task_kind, s.kind, s.link_source,
                    (SELECT t.name FROM teams t WHERE t.id = s.team_id) AS team_name,
                    s.parent_project_id, s.parent_session_id,
                    s.path_exists, s.grouping_reason,
@@ -2153,7 +2498,7 @@ def search(db_path, q, limit=50, offset=0):
                        s.project_id AS record_project_id, f.session_id, f.title,
                        f.path, f.role,
                        snippet(messages_fts, 5, '<mark>', '</mark>', '...', 12) AS snippet,
-                       s.last_active, s.session_kind, s.task_kind,
+                       s.last_active, s.session_kind, s.task_kind, s.kind, s.link_source,
                        (SELECT t.name FROM teams t WHERE t.id = s.team_id) AS team_name,
                        s.parent_project_id, s.parent_session_id,
                        s.path_exists, s.grouping_reason,

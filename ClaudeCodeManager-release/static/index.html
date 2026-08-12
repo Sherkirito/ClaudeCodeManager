@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Claude Code 管理器</title>
   <link rel="icon" type="image/png" href="/static/app-icon.png?v=20260716-icon-v3">
-  <link rel="stylesheet" href="/static/style.css?v=20260813-agent-teams">
+  <link rel="stylesheet" href="/static/style.css?v=20260813-redesign">
 </head>
 <body>
   <div class="app-shell" id="app-shell">
@@ -27,7 +27,7 @@
         </button>
         <button class="nav-item" type="button" data-route="sessions">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3z"/><path d="M8 9h8M8 12h5"/></svg>
-          <span>跨项目会话</span>
+          <span>会话</span>
         </button>
         <button class="nav-item" type="button" data-route="teams">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.25"/><path d="M3.8 19.2a5.25 5.25 0 0 1 10.4 0"/><circle cx="16.6" cy="9.4" r="2.55"/><path d="M15.2 13.9a4.3 4.3 0 0 1 4.8 4.3"/></svg>
@@ -43,7 +43,7 @@
         <p class="status-heading">本地环境</p>
         <div class="status-row"><span class="status-dot is-pending" id="claude-status-dot"></span><span>Claude CLI</span><strong id="claude-status-text">检测中</strong></div>
         <div class="status-row"><span class="status-dot is-pending" id="ai-status-dot"></span><span>AI 服务</span><strong id="ai-status-text">检测中</strong></div>
-        <p class="version">v2.0 preview.16</p>
+        <p class="version">v2.1.0</p>
       </div>
     </aside>
 
@@ -99,7 +99,7 @@
         <div class="command-preview"><span>启动参数</span><code id="permission-preview">使用 Claude Code 默认权限</code></div>
         <div class="inline-alert alert-warning" id="launch-migration-warning" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg>
-          <div><strong>需要先迁移会话</strong><p>检测到项目已映射到新位置，但此会话尚未迁移。请前往项目的“位置与迁移”页签完成迁移后再恢复。</p><button class="text-button" type="button" data-action="go-to-migration">前往位置与迁移 →</button></div>
+          <div><strong>需要先迁移会话</strong><p>检测到项目已映射到新位置，但此会话尚未迁移。请前往系统设置 → 数据维护 → JSONL 迁移完成迁移后再恢复。</p><button class="text-button" type="button" data-action="go-to-migration">前往数据维护 →</button></div>
         </div>
         <p class="form-error" id="launch-error" role="alert" hidden></p>
       </div>
@@ -110,7 +110,7 @@
   <dialog class="modal confirm-modal" id="confirm-dialog" aria-labelledby="confirm-title">
     <form method="dialog">
       <div class="modal-head compact"><div class="modal-icon is-danger" id="confirm-icon"><svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17h.01"/></svg></div><div><span class="eyebrow" id="confirm-eyebrow">安全确认</span><h2 id="confirm-title">确认操作</h2></div></div>
-      <div class="modal-body"><p class="confirm-message" id="confirm-message"></p><div class="confirm-detail" id="confirm-detail" hidden></div></div>
+      <div class="modal-body"><p class="confirm-message" id="confirm-message"></p><div class="confirm-detail" id="confirm-detail" hidden></div><label class="confirm-checkbox" id="confirm-checkbox" hidden><input type="checkbox" id="confirm-checkbox-input" checked><span id="confirm-checkbox-label"></span></label></div>
       <div class="modal-foot"><button class="button button-ghost" value="cancel" type="submit">取消</button><button class="button button-danger" id="confirm-submit" value="confirm" type="submit">确认</button></div>
     </form>
   </dialog>
@@ -119,6 +119,6 @@
   <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <noscript><div class="noscript"><h1>需要启用 JavaScript</h1><p>Claude Code 管理器需要 JavaScript 才能运行。</p></div></noscript>
-  <script type="module" src="/static/app.js?v=20260813-agent-teams"></script>
+  <script type="module" src="/static/app.js?v=20260813-redesign"></script>
 </body>
 </html>

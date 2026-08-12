@@ -126,8 +126,8 @@ DEFAULT_API_CONFIG = {
 
 DEFAULT_QL_PATH = os.path.expanduser("~")
 
-APP_VERSION = "v2.0-preview.16"
-APP_UI_VERSION = "v2.0-preview.16"
+APP_VERSION = "v2.1.0"
+APP_UI_VERSION = "v2.1.0"
 # The index is a rebuildable cache shared by source and packaged launches.
 # Keeping it outside EXE_DIR prevents the two launch modes from drifting apart.
 INDEX_DATA_DIR = (
@@ -1342,6 +1342,71 @@ def resume_migration_hint(project_id, session_id):
 
 
 # =============================================================================
+# v2 API query helpers (contract §4.1 / §4.5)
+# =============================================================================
+
+V2_KINDS = ("all", "primary", "job", "sdk", "subagent", "teammate", "automatic")
+V2_SCOPES = ("project", "team", "parent")
+
+
+def _parse_kind(qs):
+    """Validate the sessions `kind` query param; default is "all" (§4.1, C1)."""
+    kind = ((qs.get("kind") or ["all"])[0]).strip().lower()
+    if kind not in V2_KINDS:
+        raise ValueError("invalid kind")
+    return kind
+
+
+def _parse_scope(qs):
+    """Validate the sessions `scope` query param: empty | project:<id> |
+    team:<id> | parent:<id>. Returns None when absent."""
+    scope = ((qs.get("scope") or [""])[0]).strip()
+    if not scope:
+        return None
+    prefix, sep, value = scope.partition(":")
+    if sep != ":" or prefix.lower() not in V2_SCOPES or not value:
+        raise ValueError("invalid scope")
+    validators = {
+        "project": _VALID_ID.match,
+        "parent": _VALID_ID.match,
+        "team": _is_valid_team_id,
+    }
+    if not validators[prefix.lower()](value):
+        raise ValueError("invalid scope")
+    return scope
+
+
+def _collect_nested_sessions(filepath, session_id, cascade):
+    """Cascade target list for trash-session: [(session_id, jsonl_path), ...].
+
+    Only top-level transcripts (<record>/<uuid>.jsonl) own nested logs, which
+    live under <record>/<uuid>/subagents/ (subagents + teammates, contract
+    §4.5). Trashing from a nested row never cascades, so its own file is the
+    only member of the list. Nested ids follow the indexer's synthetic scheme
+    <lead-uuid>--agent-<name>. Returns [] when cascade is off or there is
+    nothing nested to collect."""
+    if not cascade:
+        return []
+    real_filepath = os.path.realpath(filepath)
+    if os.path.basename(os.path.dirname(real_filepath)) == "subagents":
+        return []  # 子代理/队友行发起回收不级联
+    nested_dir = os.path.join(os.path.dirname(real_filepath), session_id, "subagents")
+    nested_root = os.path.realpath(nested_dir)
+    if not os.path.isdir(nested_root):
+        return []
+    result = []
+    for root, _, files in os.walk(nested_root):
+        for name in sorted(files):
+            if not name.startswith("agent-") or not name.endswith(".jsonl"):
+                continue
+            nested_path = os.path.realpath(os.path.join(root, name))
+            if not nested_path.startswith(nested_root + os.sep):
+                continue
+            result.append((session_id + "--" + name[:-6], nested_path))
+    return result
+
+
+# =============================================================================
 # HTTP Server
 # =============================================================================
 
@@ -1420,6 +1485,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_v2_trash_projects()
         elif path == "/api/v2/trash-sessions":
             self._handle_v2_trash_sessions()
+        elif path == "/api/v2/orphan-history-sessions/remove":
+            self._handle_v2_orphan_remove()
         elif path == "/api/v2/path-map":
             self._handle_v2_path_map()
         elif path == "/api/v2/path-map-delete":
@@ -1506,12 +1573,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(load_path_mappings())
                 return
             if subpath == "sessions":
+                try:
+                    kind = _parse_kind(qs)
+                    scope = _parse_scope(qs)
+                except ValueError as e:
+                    self._send_json({"error": str(e)}, 400)
+                    return
                 data = v2_index.list_sessions(
                     INDEX_DB_FILE,
+                    kind=kind,
+                    scope=scope,
                     q=((qs.get("q") or [""])[0]).strip(),
                     limit=self._q_int(qs, "limit", 80, 1, 200),
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
-                    kind=((qs.get("kind") or ["primary"])[0]).strip().lower(),
                 )
                 attach_session_summaries(data.get("items", []))
                 self._send_json(data)
@@ -1559,13 +1633,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not _VALID_ID.match(project_id):
                     self._send_json({"error": "invalid project id"}, 400)
                     return
+                try:
+                    kind = _parse_kind(qs)
+                except ValueError as e:
+                    self._send_json({"error": str(e)}, 400)
+                    return
+                # Legacy entry point kept as an alias of the canonical one
+                # (contract §4.2): equivalent to scope=project:<id>.
                 data = v2_index.list_sessions(
                     INDEX_DB_FILE,
-                    project_id=project_id,
+                    kind=kind,
+                    scope="project:" + project_id,
                     q=((qs.get("q") or [""])[0]).strip(),
                     limit=self._q_int(qs, "limit", 80, 1, 200),
                     offset=self._q_int(qs, "offset", 0, 0, 1000000),
-                    kind=((qs.get("kind") or ["primary"])[0]).strip().lower(),
                 )
                 attach_session_summaries(data.get("items", []))
                 self._send_json(data)
@@ -1588,6 +1669,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not detail:
                     self._send_json({"error": "session not found"}, 404)
                     return
+                # §4.3: the detail response no longer carries children/related
+                # arrays — descendants are browsed via #sessions?parent=<id>.
+                # descendant_count is produced by the indexer and passes through;
+                # this strip only guards the API boundary against stale fields.
+                for key in ("children", "related", "related_sessions", "related_total"):
+                    detail.pop(key, None)
+                session = detail.get("session")
+                if isinstance(session, dict):
+                    for key in ("children", "related", "related_sessions", "related_total"):
+                        session.pop(key, None)
                 stored = load_session_summaries()
                 record_project_id = detail["session"].get("record_project_id") or parts[0]
                 detail["session"]["ai_summary"] = stored.get(
@@ -1708,6 +1799,12 @@ class Handler(BaseHTTPRequestHandler):
         if not project_id or not session_id or not _VALID_ID.match(project_id) or not _VALID_ID.match(session_id):
             self._send_json({"ok": False, "message": "无效的项目或会话 ID"}, 400)
             return
+        # Contract §4.5: cascade defaults to true. Trashing from a nested row
+        # (subagent/teammate) never cascades; _collect_nested_sessions enforces
+        # that based on the physical file location.
+        cascade = data.get("cascade", True)
+        if isinstance(cascade, str):
+            cascade = cascade.strip().lower() not in ("0", "false", "no", "off")
         project_id = v2_index.record_project_id(INDEX_DB_FILE, project_id, session_id)
         filepath = _resolve_session_file(project_id, session_id)
         if not filepath or not os.path.isfile(filepath):
@@ -1726,9 +1823,36 @@ class Handler(BaseHTTPRequestHandler):
                 "original_path": filepath,
                 "trashed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+            trashed = [session_id]
+            for nested_id, nested_path in _collect_nested_sessions(filepath, session_id, cascade):
+                try:
+                    nested_dest = _unique_trash_path(os.path.join(
+                        dest_dir, nested_id + "_" + _trash_stamp() + ".jsonl"))
+                    shutil.move(nested_path, nested_dest)
+                    _move_agent_meta(nested_path, nested_dest)
+                    _write_trash_meta(nested_dest, {
+                        "type": "session",
+                        "project_id": project_id,
+                        "session_id": nested_id,
+                        "original_path": nested_path,
+                        "trashed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    trashed.append(nested_id)
+                except Exception:
+                    # A nested file that cannot be moved stays in place and is
+                    # re-indexed on the next scan; never fail the whole request.
+                    continue
             invalidate_project_cache()
             ensure_v2_index(force=True)
-            self._send_json({"ok": True, "message": "会话已移到回收站", "trash_path": dest})
+            message = "会话已移到回收站"
+            if len(trashed) > 1:
+                message = "会话及 " + str(len(trashed) - 1) + " 个下属会话已移到回收站"
+            self._send_json({
+                "ok": True,
+                "message": message,
+                "trashed": trashed,
+                "trash_path": dest,
+            })
         except Exception as e:
             self._send_json({"ok": False, "message": str(e)}, 500)
 
@@ -1840,6 +1964,33 @@ class Handler(BaseHTTPRequestHandler):
             "errors": errors,
             "message": f"批量移动完成: {moved} 成功, {failed} 失败",
         }, 200 if failed == 0 else 207)
+
+    def _handle_v2_orphan_remove(self):
+        """Explicitly remove one orphan history record (§4.4, C3): the only
+        user path that makes a lost-history record disappear."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            data = json.loads(self.rfile.read(length))
+            session_id = data.get("session_id", "")
+        except Exception:
+            self._send_json({"ok": False, "message": "请求格式错误"}, 400)
+            return
+        if not isinstance(session_id, str) or not session_id.strip():
+            self._send_json({"ok": False, "message": "缺少 session_id"}, 400)
+            return
+        session_id = session_id.strip()
+        if len(session_id) > 256:
+            self._send_json({"ok": False, "message": "session_id 过长"}, 400)
+            return
+        try:
+            result = v2_index.remove_orphan_history_sessions(INDEX_DB_FILE, [session_id])
+        except Exception:
+            # No error details in the response: orphan records carry session
+            # identifiers and must not leak into logs or payloads.
+            self._send_json({"ok": False, "message": "移除失败"}, 500)
+            return
+        removed = result if isinstance(result, int) else (result.get("removed", 0) if isinstance(result, dict) else 0)
+        self._send_json({"ok": True, "removed": int(removed), "message": "记录已移除"})
 
     def _handle_stats(self):
         projects = get_cached_projects()

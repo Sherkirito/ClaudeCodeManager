@@ -333,6 +333,16 @@ class TeamIndexTests(unittest.TestCase):
         self.assertEqual(indexer["session"]["team_id"], "demo-team")
         self.assertEqual(indexer["session"]["team_confidence"], "lead_dir")
         self.assertEqual(indexer["confidence"], "lead_dir")
+        # config-branch sessions have no .meta.json; agent display fields are
+        # backfilled from the member row so §4.1 agent stays rich
+        self.assertEqual(indexer["session"]["agent_name"], "indexer")
+        self.assertEqual(indexer["session"]["agent_type"], "indexer")
+        self.assertEqual(indexer["session"]["agent_color"], "#00aa00")
+        detail = v2_index.session_detail(self.db, self.record_id, indexer["session"]["id"])
+        self.assertIsNotNone(detail)
+        for banned in ("file_path", "jsonl_rel_path", "meta_json", "record_project_id"):
+            self.assertNotIn(banned, detail["session"], "detail 不得外泄 " + banned)
+        self.assertEqual(detail["session"]["agent"]["name"], "indexer")
         # member-level links backfill task_kind, so the meta-less member shows
         # up in teammate listings while the unrelated helper stays out
         self.assertEqual(indexer["session"]["task_kind"], "in_process_teammate")
@@ -493,11 +503,16 @@ class TeamIndexTests(unittest.TestCase):
         self.assertEqual(all_data["primary_total"], 1)
         self.assertEqual(all_data["automatic_all_total"], 1)
         self.assertEqual(all_data["teammate_total"], 1)
-        self.assertEqual({row["session_kind"] for row in all_data["items"]}, {"primary", "subagent"})
+        # §4.2: session_kind aliases the new kind column (teammate, not subagent)
+        self.assertEqual({row["session_kind"] for row in all_data["items"]}, {"primary", "teammate"})
         teammate_row = next(
             row for row in all_data["items"] if row["task_kind"] == "in_process_teammate"
         )
         self.assertEqual(teammate_row["team_name"], "Demo Team")
+        # §4.1/C2: list items carry descendant counts (lead=1, leaf=0)
+        lead_row = next(row for row in all_data["items"] if row["id"] == self.lead_uuid)
+        self.assertEqual(lead_row["descendant_count"], 1)
+        self.assertEqual(teammate_row["descendant_count"], 0)
 
     def test_team_detail_resolves_cross_project_member(self):
         other_record = "D--OtherRecord"
